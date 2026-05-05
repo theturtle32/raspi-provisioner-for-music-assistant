@@ -1,0 +1,247 @@
+# Raspberry Pi Provisioner for Music Assistant
+
+Automated SD card provisioning for Raspberry Pi Snapcast and AirPlay players
+managed by [Music Assistant](https://music-assistant.io/).
+
+Flash a stock Raspberry Pi OS image, run one script, and the Pi comes up
+fully configured — correct hostname, audio routing, network preferences,
+ALSA state persistence, and overlay filesystem — ready to appear in Music
+Assistant within ~90 seconds of first boot.
+
+---
+
+## How it works
+
+Two files do all the work:
+
+| File | When it runs | What it does |
+|------|-------------|--------------|
+| `patch-userdata.py` | On your Mac/PC before flashing | Writes `player.env` and patches the Raspberry Pi Imager `user-data` on the boot partition |
+| `provision.sh` | On the Pi at first boot (via cloud-init) | Configures audio, networking, ALSA, and overlay FS; embedded in `user-data` by the patching script |
+
+---
+
+## Prerequisites
+
+- **Raspberry Pi Imager** — use it to write Raspberry Pi OS Lite (64-bit) to a
+  card, with SSH enabled and WiFi credentials set. Stop before ejecting.
+- **Python 3** with PyYAML: `pip install pyyaml`
+- **Music Assistant** running on your local network with the Snapcast or AirPlay
+  integration enabled.
+
+---
+
+## Quick start
+
+### 1. Flash the card
+
+Use Raspberry Pi Imager to write **Raspberry Pi OS Lite (64-bit)**.
+In the Imager settings ("OS Customisation"), configure:
+
+- SSH enabled (password or public key)
+- WiFi SSID and password
+- Leave hostname as-is — the provisioning script sets it
+
+Do **not** eject the card yet.
+
+### 2. Patch the boot partition
+
+```bash
+python3 patch-userdata.py /Volumes/bootfs
+```
+
+Replace `/Volumes/bootfs` with the actual mount path of the boot partition.
+The script prompts for player config, writes `player.env` to the boot
+partition, embeds `provision.sh` into `user-data`, and patches the cloud-init
+config.
+
+### 3. Eject and boot
+
+Eject the card, insert it into the Pi, and power on. The Pi will:
+
+1. Sync time via NTP
+2. Install the required packages (`snapclient` or `shairport-sync`, `alsa-utils`, etc.)
+3. Run `provision.sh`
+4. Reboot
+
+After the final reboot (~90 seconds total), the player appears in Music
+Assistant.
+
+---
+
+## Configuration prompts
+
+`patch-userdata.py` asks for these values. Press Enter to keep the value
+shown in brackets when re-running against an already-configured card.
+
+| Prompt | Description |
+|--------|-------------|
+| `MULTI_OUTPUT` | `true` for a USB hub with multiple DACs; `false` (default) for a single output |
+| `MA_HOST` | IP address of the Music Assistant server |
+| `PLAYER_TYPE` | `snapcast` (default) or `airplay` |
+| `ROOM_NAME` | Used for the hostname (`snapplayer-<room>`) and MA player name |
+| `AUDIO_DEVICE` | ALSA device string, or `auto` to detect the first non-built-in card |
+| `SNAPCLIENT_LATENCY` | Latency offset in ms (snapcast only; see [Latency tuning](#latency-tuning)) |
+| `WIFI_MODE` | `builtin` (default), `usb`, or `none` |
+| `HAT_OVERLAY` | Optional audio HAT; adds `dtoverlay` to `config.txt` |
+
+See `player.env.example` for a fully annotated example.
+
+---
+
+## Player types
+
+### Snapcast (`PLAYER_TYPE=snapcast`)
+
+Runs `snapclient` pointing at Music Assistant's built-in Snapcast server.
+Synchronized multi-room audio across all Snapcast players.
+
+### AirPlay (`PLAYER_TYPE=airplay`)
+
+Runs `shairport-sync`, making the Pi appear as an AirPlay device in Music
+Assistant. Useful for rooms where sync with other players is not needed.
+
+---
+
+## Multi-output mode
+
+A single Pi connected to a USB hub with multiple identical DACs can serve
+multiple rooms independently.
+
+Each output is defined by a room name and the USB port it's physically plugged
+into. The provisioner:
+
+- Writes udev rules to rename ALSA card IDs by USB port (`room_<slug>`)
+- Creates a separate `snapclient-<room>.service` for each output
+
+```
+MULTI_OUTPUT=true
+USB_VENDOR_ID=0d8c
+USB_PRODUCT_ID=0008
+OUTPUT_1_ROOM="kitchen"
+OUTPUT_1_USB_PORT=1-1.2
+OUTPUT_2_ROOM="garage"
+OUTPUT_2_USB_PORT=1-1.3
+```
+
+The `patch-userdata.py` prompts for room/port pairs interactively. Leave
+the room name blank to finish entering outputs.
+
+To find USB port paths, run `lsusb -t` or `udevadm info` on the Pi.
+
+---
+
+## Latency tuning
+
+Snapcast synchronizes audio across players by having each client report a
+latency offset to the server. Different hardware introduces different delays:
+I2S HATs reach the speaker faster than USB DACs, and WiFi jitter varies by
+room.
+
+### Finding the right value
+
+1. Provision all players with `SNAPCLIENT_LATENCY=0` (the default).
+2. Add them to a sync group in Music Assistant and play music.
+3. Walk between rooms and listen for offset.
+4. Tune in real time via JSON-RPC while music is playing:
+
+```bash
+# List clients and their current latency
+curl http://192.168.3.42:1780/jsonrpc \
+  -d '{"id":1,"jsonrpc":"2.0","method":"Server.GetStatus"}'
+
+# Adjust latency for a specific client (use the MAC from GetStatus)
+curl http://192.168.3.42:1780/jsonrpc -d '{
+  "id":1,"jsonrpc":"2.0",
+  "method":"Client.SetLatency",
+  "params":{"id":"<client-mac>","latency":-20}
+}'
+```
+
+5. Once you have the right value, re-run `patch-userdata.py` on the card,
+   enter the latency, re-flash, and it's permanent.
+
+**Known good values:**
+
+| Hardware | Typical offset |
+|----------|---------------|
+| Merus Audio I2S amp | `-20 ms` |
+| C-Media USB DAC | `0 ms` (reference) |
+
+Negative values play *earlier* — use them for hardware that is natively faster
+to the speaker than your reference device.
+
+---
+
+## WiFi modes
+
+| Mode | Description |
+|------|-------------|
+| `builtin` | Built-in `wlan0` (default). Installs a NM dispatcher for automatic reconnection. |
+| `usb` | USB adapter on `wlan1`. Binds the WiFi profile to `wlan1`, sets `wlan0` as unmanaged. Requires the adapter to be plugged in before first boot. |
+| `none` | WiFi disabled entirely (ethernet only). Uses `rfkill` to block all WiFi. |
+
+All modes install NetworkManager config for infinite reconnection retries.
+
+---
+
+## Audio HAT support
+
+Pass a HAT name when prompted. The patching script writes the appropriate
+`dtoverlay` to `config.txt` and disables the built-in audio if required.
+
+| Name | Overlay | Disables onboard audio |
+|------|---------|----------------------|
+| `merus-amp` | `merus-amp` | Yes |
+| `hifiberry-amp` | `hifiberry-amp` | Yes |
+| `hifiberry-dac` | `hifiberry-dac` | Yes |
+| `hifiberry-dacplus` | `hifiberry-dacplus` | Yes |
+| `none` | — | No |
+
+`provision.sh` also runs HAT-specific tuning at provisioning time. Currently
+implemented: Merus Audio amp limiter bypass (prevents clipping at high volumes).
+
+---
+
+## What provision.sh does
+
+Runs once on first boot via cloud-init `runcmd`, then the filesystem is locked
+read-only via `raspi-config overlayfs`. Steps in order:
+
+1. **Audio routing** — writes `/etc/default/snapclient` (single-output) or
+   per-room systemd service files (multi-output), or `shairport-sync.conf`
+   (AirPlay).
+2. **ALSA volume** — sets all mixer controls to 100%, runs HAT-specific tuning,
+   saves state to `asound.state` on the boot partition.
+3. **ALSA restore service** — installs `alsa-restore-boot.service` to replay
+   the saved state on every subsequent boot (before snapclient starts).
+4. **Network** — applies WiFi mode config and NM reconnection dispatcher.
+5. **Startup chime** — installs a one-shot service that plays three ascending
+   tones on the first post-provisioning boot, confirming audio is working.
+6. **Journald** — sets `Storage=volatile` so logs go to RAM, not the SD card.
+7. **Overlay FS** — enables read-only root filesystem via `raspi-config`.
+
+---
+
+## Re-provisioning
+
+The patching script is idempotent. To update a card:
+
+1. Mount the boot partition on your Mac/PC.
+2. Re-run `patch-userdata.py /Volumes/bootfs`.
+3. Existing values are pre-filled; change only what you need.
+4. The script re-embeds the current `provision.sh` from disk automatically.
+
+To change config on an already-booted Pi: disable overlay FS, edit
+`/boot/firmware/player.env` and `/etc/default/snapclient` (or the relevant
+service file), re-enable overlay FS, reboot.
+
+---
+
+## Files
+
+```
+patch-userdata.py     — Run on Mac/PC to prepare the SD card
+provision.sh          — Runs on the Pi at first boot (embedded into user-data)
+player.env.example    — Annotated example of all player.env keys
+```
