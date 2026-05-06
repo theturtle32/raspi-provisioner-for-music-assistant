@@ -373,19 +373,21 @@ unmanaged-devices=interface-name:wlan0
 EOF
             echo "  Built-in wlan0 unmanaged by NM."
 
-            # Install dispatcher script for persistent reconnection
+            # Dispatcher: disable wpa_supplicant background scanning when wlan1 comes up.
+            # USB adapters (MT7601U and similar) aggressively roam-hunt every few seconds
+            # when bgscan is active, deauthenticating and breaking long-lived TCP streams.
+            # Firing on "up" (not "down") avoids triggering scans via nmcli connection up.
             mkdir -p /etc/NetworkManager/dispatcher.d
-            cat > /etc/NetworkManager/dispatcher.d/99-wifi-reconnect.sh <<'EOF'
+            cat > /etc/NetworkManager/dispatcher.d/99-wifi-bgscan-disable.sh <<'EOF'
 #!/bin/bash
 INTERFACE="$1"
 ACTION="$2"
-if [ "$ACTION" = "down" ] && [ "$INTERFACE" = "wlan1" ]; then
-    sleep 5
-    nmcli connection up "$(nmcli -t -f NAME,DEVICE connection show | grep ':wlan1' | head -1 | cut -d: -f1)" 2>/dev/null || true
+if [ "$ACTION" = "up" ] && [ "$INTERFACE" = "wlan1" ]; then
+    wpa_cli -p /var/run/wpa_supplicant -i wlan1 set_network 0 bgscan '""' 2>/dev/null || true
 fi
 EOF
-            chmod +x /etc/NetworkManager/dispatcher.d/99-wifi-reconnect.sh
-            echo "  Reconnection dispatcher installed."
+            chmod +x /etc/NetworkManager/dispatcher.d/99-wifi-bgscan-disable.sh
+            echo "  bgscan-disable dispatcher installed."
             ;;
 
         builtin|*)
