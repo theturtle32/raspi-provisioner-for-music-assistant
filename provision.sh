@@ -474,6 +474,19 @@ EOF
     echo "Startup chime service installed."
 }
 
+# ══ PASSWORDLESS SUDO ══════════════════════════════════════════════════════════
+configure_passwordless_sudo() {
+    local pi_user
+    pi_user=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 {print $1; exit}')
+    if [ -n "$pi_user" ]; then
+        echo "${pi_user} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/010-nopasswd
+        chmod 440 /etc/sudoers.d/010-nopasswd
+        echo "Passwordless sudo enabled for: ${pi_user}"
+    else
+        echo "WARNING: No regular user found, skipping passwordless sudo"
+    fi
+}
+
 # ══ JOURNALD → RAM ═════════════════════════════════════════════════════════════
 configure_journald() {
     echo "Configuring journald to use volatile (RAM) storage..."
@@ -517,12 +530,15 @@ fi
 # 5. Logs to RAM only
 configure_journald
 
-# 6. Restore /etc/issue and notify before reboot
+# 6. Passwordless sudo for the provisioned user
+configure_passwordless_sudo
+
+# 7. Restore /etc/issue and notify before reboot
 printf 'Raspbian GNU/Linux \\n \\l\n' > /etc/issue
 wall $'\n*** PROVISIONING COMPLETE — rebooting now. ***\nThis is expected and normal.\n' 2>/dev/null || true
 printf '\n\n*** PROVISIONING COMPLETE — rebooting now. ***\n\n' > /dev/tty1 2>/dev/null || true
 
-# 7. Enable overlay filesystem — must be last step before reboot
+# 8. Enable overlay filesystem — must be last step before reboot
 echo "Enabling overlay filesystem..."
 raspi-config nonint enable_overlayfs
 
