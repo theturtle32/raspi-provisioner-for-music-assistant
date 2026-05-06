@@ -346,13 +346,16 @@ EOF
             fi
 
             # Modify original profile to bind to wlan1 with low metric
+            # Disable power saving — USB WiFi adapters (especially MT7601U) drop
+            # their association when power save is active, killing TCP streams.
             nmcli connection modify "$wifi_profile" \
                 connection.interface-name wlan1 \
                 ipv4.route-metric 100 \
                 ipv6.route-metric 100 \
                 connection.autoconnect yes \
-                connection.autoconnect-retries -1
-            echo "  Bound '$wifi_profile' to wlan1 (metric=100)"
+                connection.autoconnect-retries -1 \
+                802-11-wireless.powersave 2
+            echo "  Bound '$wifi_profile' to wlan1 (metric=100, power save disabled)"
 
             # Disable built-in wlan0 via NetworkManager
             nmcli radio wifi off 2>/dev/null || true
