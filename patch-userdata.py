@@ -92,6 +92,91 @@ def provisioner_version():
         return "unknown"
 
 
+ARCHIVE_DIRNAME = "players"
+
+
+def archive_dir():
+    """Directory holding a copy of every player.env this script has written."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        ARCHIVE_DIRNAME)
+
+
+def read_env_file(path):
+    """Parse a shell-style KEY=value file into a dict, ignoring comments."""
+    values = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                values[k.strip()] = v.strip().strip('"')
+    return values
+
+
+def list_archived_players():
+    """Return [(label, path)] of previously prepared players, newest first."""
+    directory = archive_dir()
+    if not os.path.isdir(directory):
+        return []
+    entries = []
+    for name in sorted(os.listdir(directory)):
+        if name.endswith(".env"):
+            full = os.path.join(directory, name)
+            entries.append((name[:-4], full, os.path.getmtime(full)))
+    entries.sort(key=lambda e: e[2], reverse=True)
+    return [(label, path) for label, path, _ in entries]
+
+
+def seed_from_archive():
+    """
+    Offer to pre-fill prompts from a previously prepared player.
+
+    Re-imaging a card rewrites the boot partition and takes player.env with it,
+    so without a copy held on this machine every reflash means reconstructing
+    each answer by hand.
+    """
+    players = list_archived_players()
+    if not players:
+        return {}
+
+    print("\n  No player.env on this card — writing a fresh image wipes it.")
+    print("  Previously prepared players:")
+    for i, (label, _) in enumerate(players, 1):
+        print(f"    {i}) {label}")
+    print("    n) start fresh")
+
+    choice = prompt("Seed prompts from which?", "1").strip().lower()
+    if choice in ("n", "no", "none"):
+        return {}
+
+    try:
+        index = int(choice)
+    except ValueError:
+        print("  Unrecognised choice — starting fresh.")
+        return {}
+
+    if not 1 <= index <= len(players):
+        print("  Out of range — starting fresh.")
+        return {}
+
+    label, path = players[index - 1]
+    print(f"  Seeding from '{label}'")
+    values = read_env_file(path)
+    # The archived revision describes the card that was built then; this run
+    # stamps its own.
+    values.pop("PROVISIONER_VERSION", None)
+    return values
+
+
+def save_archive_copy(player_env_path, hostname):
+    """Keep a copy of the finished player.env, keyed by hostname."""
+    directory = archive_dir()
+    os.makedirs(directory, exist_ok=True)
+    dest = os.path.join(directory, f"{hostname}.env")
+    shutil.copy2(player_env_path, dest)
+    return dest
+
+
 def load_provision_sh():
     """Load provision.sh from the same directory as this script."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -295,15 +380,11 @@ def patch(data, hostname, multi_output, player_type="snapcast"):
 def create_player_env(path, boot_partition):
     existing = {}
     if os.path.exists(path):
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, _, v = line.partition("=")
-                    existing[k.strip()] = v.strip().strip('"')
+        existing = read_env_file(path)
         print(f"\nUpdating existing player.env")
     else:
         print(f"\nCreating player.env")
+        existing = seed_from_archive()
 
     print("  (Press Enter to keep existing value shown in brackets)\n")
 
@@ -440,6 +521,14 @@ def main():
         hostname = "snapplayer-multi"
     else:
         hostname = derive_hostname(room_name)
+
+    # Keep a copy on this machine. The card's own copy does not survive the next
+    # re-image, and this is the only record of what a given player was set to.
+    try:
+        archived = save_archive_copy(player_env_path, hostname)
+        print(f"  Archived config: {os.path.relpath(archived)}")
+    except OSError as exc:
+        print(f"  WARNING: could not archive player config: {exc}")
 
     # ── Patch config.txt for HAT if selected ──────────────────────────────────
     if hat and hat != "none" and HAT_OVERLAYS.get(hat):

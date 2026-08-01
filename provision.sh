@@ -972,15 +972,31 @@ configure_passwordless_sudo() {
 # one. PROVISIONER_VERSION is set in player.env by patch-userdata.py.
 write_version_stamp() {
     local stamp="${BOOT_PART}/provisioner-version"
+
+    # Ground truth for what audio hardware actually enumerated, independent of
+    # what HAT_OVERLAY claimed. Answers "what is in this box?" without having to
+    # infer it from a kernel module list.
+    local cards
+    cards=$(aplay -l 2>/dev/null | sed -n 's/^card [0-9]*: \([^ ]*\) .*/\1/p' \
+        | sort -u | paste -sd, -) || true
+    [ -z "$cards" ] && cards="none"
+
     {
-        echo "version:     ${PROVISIONER_VERSION}"
-        echo "provisioned: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-        echo "hostname:    $(hostname 2>/dev/null || echo unknown)"
-        echo "player_type: ${PLAYER_TYPE}"
-        echo "wifi_mode:   ${WIFI_MODE}"
+        echo "version:      ${PROVISIONER_VERSION}"
+        echo "provisioned:  $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        echo "hostname:     $(hostname 2>/dev/null || echo unknown)"
+        echo "player_type:  ${PLAYER_TYPE}"
+        echo "wifi_mode:    ${WIFI_MODE}"
+        echo "multi_output: ${MULTI_OUTPUT}"
+        echo "room_name:    ${ROOM_NAME}"
+        echo "ma_host:      ${MA_HOST}"
+        echo "hat_overlay:  ${HAT_OVERLAY}"
+        echo "audio_device: ${AUDIO_DEVICE}"
+        echo "latency_ms:   ${SNAPCLIENT_LATENCY:-0}"
+        echo "sound_cards:  ${cards}"
     } > /etc/provisioner-version
     cp /etc/provisioner-version "$stamp" 2>/dev/null || true
-    echo "Version stamp written: ${PROVISIONER_VERSION}"
+    echo "Version stamp written: ${PROVISIONER_VERSION} (cards: ${cards})"
 }
 
 # ══ JOURNALD → RAM ═════════════════════════════════════════════════════════════

@@ -281,7 +281,7 @@ partition survive — read them before power-cycling anything:
 | File | Contents |
 |------|----------|
 | `netlog.txt` | Watchdog events and a journal excerpt captured at the moment each fault was detected. Size-capped at 256 KB. |
-| `provisioner-version` | Which provisioner revision built this card. |
+| `provisioner-version` | Which revision built this card, plus the resolved config: room, MA host, WiFi mode, HAT overlay, audio device, latency, and the sound cards that actually enumerated. Answers "what is in this box?" without inferring it from a kernel module list. Also at `/etc/provisioner-version`. |
 | `provision-failed.txt` | Present only if provisioning itself failed. |
 
 Useful checks on a running player:
@@ -308,6 +308,17 @@ The patching script is idempotent. To update a card:
 3. Existing values are pre-filled; change only what you need.
 4. The script re-embeds the current `provision.sh` from disk automatically.
 
+### After re-imaging a card
+
+Writing a fresh image with Raspberry Pi Imager rewrites the boot partition, so
+`player.env` and everything else the provisioner put there is gone — there is
+nothing left on the card to pre-fill from.
+
+Every run therefore archives the finished config to `players/<hostname>.env` on
+the machine running the script. When a card has no `player.env`, you are offered
+the list of previously prepared players and can seed all prompts from one of
+them. The directory is gitignored.
+
 To change config on an already-booted Pi: disable overlay FS, edit
 `/boot/firmware/player.env` and `/etc/default/snapclient` (or the relevant
 service file), re-enable overlay FS, reboot.
@@ -320,4 +331,6 @@ service file), re-enable overlay FS, reboot.
 patch-userdata.py     — Run on Mac/PC to prepare the SD card
 provision.sh          — Runs on the Pi at first boot (embedded into user-data)
 player.env.example    — Annotated example of all player.env keys
+players/              — Archived config per player, for seeding after a re-image
+                        (gitignored, created on first run)
 ```
