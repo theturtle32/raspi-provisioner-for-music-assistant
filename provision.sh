@@ -977,6 +977,37 @@ configure_passwordless_sudo() {
     fi
 }
 
+# ══ SSH HOST KEYS ══════════════════════════════════════════════════════════════
+# patch-userdata.py pins a per-player ed25519 host key via cloud-init's ssh_keys,
+# so re-imaging reproduces the same identity. But cloud-init only honours
+# ssh_deletekeys/ssh_genkeytypes on the branch where it generates keys itself;
+# supplying ssh_keys skips that branch, and Raspberry Pi OS has already run
+# `ssh-keygen -A` by then. The resulting RSA and ECDSA keys are fresh per image,
+# so a client that recorded one of those would still see a changed identity on
+# the next reflash — exactly what pinning is meant to prevent.
+prune_unpinned_host_keys() {
+    if [ ! -s /etc/ssh/ssh_host_ed25519_key ]; then
+        echo "WARNING: no ed25519 host key present — leaving other host keys alone"
+        return 0
+    fi
+
+    local removed=""
+    local keytype
+    for keytype in rsa ecdsa; do
+        if [ -e "/etc/ssh/ssh_host_${keytype}_key" ]; then
+            rm -f "/etc/ssh/ssh_host_${keytype}_key" \
+                  "/etc/ssh/ssh_host_${keytype}_key.pub"
+            removed="${removed:+${removed} }${keytype}"
+        fi
+    done
+
+    if [ -n "$removed" ]; then
+        echo "Pruned per-image host key types: ${removed} (ed25519 is the only identity)"
+    else
+        echo "Only an ed25519 host key present; nothing to prune."
+    fi
+}
+
 # ══ VERSION STAMP ══════════════════════════════════════════════════════════════
 # Records which revision of the provisioner built this card. Without it there is
 # no way to tell a running player apart from one imaged before a given fix — and
@@ -1063,10 +1094,13 @@ configure_journald
 # 7. Passwordless sudo for the provisioned user
 configure_passwordless_sudo
 
-# 8. Record which revision built this card
+# 8. Leave the pinned ed25519 key as the only SSH host identity
+prune_unpinned_host_keys
+
+# 9. Record which revision built this card
 write_version_stamp
 
-# 9. Restore /etc/issue and notify before reboot
+# 10. Restore /etc/issue and notify before reboot
 printf 'Raspbian GNU/Linux \\n \\l\n' > /etc/issue
 wall $'\n*** PROVISIONING COMPLETE — rebooting now. ***\nThis is expected and normal.\n' 2>/dev/null || true
 printf '\n\n*** PROVISIONING COMPLETE — rebooting now. ***\n\n' > /dev/tty1 2>/dev/null || true
@@ -1074,7 +1108,7 @@ printf '\n\n*** PROVISIONING COMPLETE — rebooting now. ***\n\n' > /dev/tty1 2>
 rm -f "${BOOT_PART}/provision-failed.txt" 2>/dev/null || true
 sync 2>/dev/null || true
 
-# 10. Enable overlay filesystem — must be last step before reboot
+# 11. Enable overlay filesystem — must be last step before reboot
 echo "Enabling overlay filesystem..."
 raspi-config nonint enable_overlayfs
 

@@ -315,14 +315,19 @@ that player's card is prepared, archived to `players/<hostname>.hostkey`, and
 injected into `user-data` so cloud-init installs it at first boot. Re-imaging
 reproduces the same identity, so `ssh` never reports a changed host key.
 
-Only ed25519 is generated (`ssh_genkeytypes`), so there is exactly one identity
-a player can ever present. Leaving RSA and ECDSA to be regenerated per image
-would mean a client that happened to record one of those still sees a change.
+ed25519 ends up the only host identity, but not via `ssh_genkeytypes` — that
+setting does **not** work here. cloud-init consults it, and `ssh_deletekeys`,
+only on the branch where it generates keys itself; supplying `ssh_keys` skips
+that branch entirely. Raspberry Pi OS has already run `ssh-keygen -A` by then,
+so RSA and ECDSA keys exist and are fresh per image. `provision.sh` prunes them
+in `prune_unpinned_host_keys()`, leaving only the pinned key. Without that step
+a client that had recorded the RSA or ECDSA key would still see a changed
+identity on the next reflash — the exact thing pinning is meant to prevent.
 
-Raspberry Pi OS ships `regenerate_ssh_host_keys.service`, which wipes and
-regenerates host keys — but it is `ConditionFirstBoot=yes` and runs at
-`sysinit`, so cloud-init's `cc_ssh` stage lands after it and wins. The pinned
-key is then baked into the image before the overlay is enabled.
+Ordering works out because `regenerate_ssh_host_keys.service` is
+`ConditionFirstBoot=yes` and runs at `sysinit`, so cloud-init's `cc_ssh` stage
+lands after it and wins. The pinned key is then baked into the image before the
+overlay is enabled.
 
 **The `players/` directory now holds private keys.** It is gitignored, but
 treat it as secret material and include it in whatever you back up — losing it

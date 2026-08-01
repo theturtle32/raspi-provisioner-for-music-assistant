@@ -426,10 +426,11 @@ def patch(data, hostname, multi_output, player_type="snapcast"):
         "ed25519_private": private_key,
         "ed25519_public": public_key,
     }
-    # Only ed25519, so there is exactly one host identity that can ever be
-    # presented. Leaving RSA and ECDSA to be generated per-image would mean a
-    # client that happened to record one of those still sees a changed key.
-    data["ssh_genkeytypes"] = ["ed25519"]
+    # Deliberately no ssh_genkeytypes here: cloud-init only consults it (and
+    # ssh_deletekeys) on the branch where it generates keys itself. Supplying
+    # ssh_keys skips that branch, so RPi OS's earlier `ssh-keygen -A` leaves
+    # per-image RSA and ECDSA keys in place regardless. provision.sh prunes them
+    # instead, so the pinned ed25519 is the only identity ever presented.
     changed.append("Pinned SSH host key (ed25519)")
 
     # ── power_state: reboot cleanly after runcmd completes ────────────────────
