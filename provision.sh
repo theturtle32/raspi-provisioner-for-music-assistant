@@ -102,6 +102,10 @@ USB_PRODUCT_ID="${USB_PRODUCT_ID:-0008}"
 HAT_OVERLAY="${HAT_OVERLAY:-none}"
 PROVISIONER_VERSION="${PROVISIONER_VERSION:-unknown}"
 
+# Populated by whichever setup_* function runs. The startup chime has to finish
+# with the sound card before these start, or they race it for the device.
+PLAYER_UNITS=""
+
 # ── Validate config ────────────────────────────────────────────────────────────
 # Fail loudly on an unrecognised value. A silent fallback to the default is how
 # a card ends up configured differently than the operator believes it is.
@@ -231,6 +235,7 @@ EOF
     echo "  Snapclient config written."
     install_restart_dropin snapclient.service
     systemctl enable snapclient
+    PLAYER_UNITS="snapclient.service"
 }
 
 # ══ AIRPLAY SETUP (shairport-sync) ════════════════════════════════════════════
@@ -277,6 +282,7 @@ EOF
     echo "  shairport-sync config written."
     install_restart_dropin shairport-sync.service
     systemctl enable shairport-sync
+    PLAYER_UNITS="shairport-sync.service"
 }
 
 # ══ MULTI-OUTPUT SETUP ═════════════════════════════════════════════════════════
@@ -343,6 +349,7 @@ WantedBy=multi-user.target
 EOF
         systemctl enable "snapclient-${room_slug}.service"
         echo "  Enabled snapclient-${room_slug}.service"
+        PLAYER_UNITS="${PLAYER_UNITS:+${PLAYER_UNITS} }snapclient-${room_slug}.service"
         instance=$((instance + 1))
     done < "$BOOT_ENV_CLEAN"
 
@@ -934,10 +941,15 @@ systemctl disable startup-chime.service
 EOF
     chmod +x /usr/local/bin/startup-chime.sh
 
+    # Ordered BEFORE the player, not after: the chime holds the sound card for
+    # about three seconds, and a player starting alongside it fails to open the
+    # device with EBUSY. Being a oneshot, the player waits for it to finish.
+    # On later boots the chime has disabled itself, so this costs nothing.
     cat > /etc/systemd/system/startup-chime.service <<EOF
 [Unit]
 Description=Play startup chime on first post-provisioning boot
-After=sound.target alsa-restore-boot.service snapclient.service
+After=sound.target alsa-restore-boot.service
+$([ -n "$PLAYER_UNITS" ] && echo "Before=${PLAYER_UNITS}")
 Wants=sound.target
 
 [Service]
