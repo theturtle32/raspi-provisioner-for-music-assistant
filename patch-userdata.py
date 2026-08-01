@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["pyyaml"]
+# ///
 """
 patch-userdata.py — Prepare a Snapcast/AirPlay player SD card
 
 Usage:
-    python3 patch-userdata.py /Volumes/bootfs
+    uv run patch-userdata.py /Volumes/bootfs        # no install needed
     python3 patch-userdata.py /media/username/bootfs
 
 What it does:
@@ -22,7 +26,9 @@ What it does:
   4. Backs up the original user-data as user-data.bak (once)
 
 Requirements:
-    pip install pyyaml
+    pyyaml. Either run via `uv run patch-userdata.py` (which resolves the
+    inline dependency block above automatically) or `pip install pyyaml`
+    into whichever interpreter you invoke.
 
 provision.sh must be in the same directory as this script.
 """
@@ -31,7 +37,20 @@ import sys
 import os
 import shutil
 import subprocess
-import yaml
+
+try:
+    import yaml
+except ImportError:
+    sys.exit(
+        "ERROR: pyyaml is not available to this interpreter.\n"
+        f"       ({sys.executable})\n"
+        "\n"
+        "Easiest fix, no install required:\n"
+        "    uv run patch-userdata.py <boot-partition>\n"
+        "\n"
+        "Or install it into the interpreter you are using:\n"
+        f"    {sys.executable} -m pip install pyyaml"
+    )
 
 # Known HAT overlays — maps a short name to (dtoverlay, disable_onboard_audio)
 HAT_OVERLAYS = {

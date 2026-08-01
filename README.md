@@ -25,7 +25,11 @@ Two files do all the work:
 
 - **Raspberry Pi Imager** — use it to write Raspberry Pi OS Lite (64-bit) to a
   card, with SSH enabled and WiFi credentials set. Stop before ejecting.
-- **Python 3** with PyYAML: `pip install pyyaml`
+- **Python 3** with PyYAML. Either use [`uv`](https://docs.astral.sh/uv/), which
+  resolves the dependency automatically from the script's inline metadata, or
+  `pip install pyyaml` into whichever interpreter you invoke. Note that on macOS
+  a bare `python3` often resolves to Xcode's interpreter rather than a Homebrew
+  one, so it may not be the interpreter you installed PyYAML into.
 - **Music Assistant** running on your local network with the Snapcast or AirPlay
   integration enabled.
 
@@ -47,7 +51,7 @@ Do **not** eject the card yet.
 ### 2. Patch the boot partition
 
 ```bash
-python3 patch-userdata.py /Volumes/bootfs
+uv run patch-userdata.py /Volumes/bootfs     # or: python3 patch-userdata.py ...
 ```
 
 Replace `/Volumes/bootfs` with the actual mount path of the boot partition.
