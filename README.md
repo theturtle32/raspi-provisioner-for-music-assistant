@@ -308,6 +308,42 @@ The patching script is idempotent. To update a card:
 3. Existing values are pre-filled; change only what you need.
 4. The script re-embeds the current `provision.sh` from disk automatically.
 
+### SSH host keys
+
+Each player gets a **pinned** ed25519 host key. It is generated the first time
+that player's card is prepared, archived to `players/<hostname>.hostkey`, and
+injected into `user-data` so cloud-init installs it at first boot. Re-imaging
+reproduces the same identity, so `ssh` never reports a changed host key.
+
+Only ed25519 is generated (`ssh_genkeytypes`), so there is exactly one identity
+a player can ever present. Leaving RSA and ECDSA to be regenerated per image
+would mean a client that happened to record one of those still sees a change.
+
+Raspberry Pi OS ships `regenerate_ssh_host_keys.service`, which wipes and
+regenerates host keys — but it is `ConditionFirstBoot=yes` and runs at
+`sysinit`, so cloud-init's `cc_ssh` stage lands after it and wins. The pinned
+key is then baked into the image before the overlay is enabled.
+
+**The `players/` directory now holds private keys.** It is gitignored, but
+treat it as secret material and include it in whatever you back up — losing it
+means the next reflash of that player mints a new identity. This is not a new
+class of exposure for the card itself: the boot partition already carries your
+WiFi PSK in both `user-data` and `network-config`. The real tradeoff is
+deliberate key *reuse*, so a leaked key stays valid across future rebuilds. If
+that matters more than convenience, use an SSH certificate authority instead.
+
+Prefer connecting by mDNS name rather than IP — `ssh snapplayer-<room>.local` —
+so a DHCP reassignment does not look like a new host.
+
+To adopt a player built **before** this existed, import its current key rather
+than letting the next reflash change it:
+
+```bash
+ssh <host> "sudo cat /etc/ssh/ssh_host_ed25519_key"     > players/<hostname>.hostkey
+ssh <host> "sudo cat /etc/ssh/ssh_host_ed25519_key.pub" > players/<hostname>.hostkey.pub
+chmod 600 players/<hostname>.hostkey
+```
+
 ### After re-imaging a card
 
 Writing a fresh image with Raspberry Pi Imager rewrites the boot partition, so
@@ -331,6 +367,7 @@ service file), re-enable overlay FS, reboot.
 patch-userdata.py     — Run on Mac/PC to prepare the SD card
 provision.sh          — Runs on the Pi at first boot (embedded into user-data)
 player.env.example    — Annotated example of all player.env keys
-players/              — Archived config per player, for seeding after a re-image
-                        (gitignored, created on first run)
+players/              — Per-player archive: config for seeding after a re-image,
+                        plus the pinned SSH host key. Gitignored, created on
+                        first run. Contains private keys — back it up.
 ```

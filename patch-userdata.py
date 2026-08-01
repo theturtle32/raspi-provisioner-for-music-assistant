@@ -168,6 +168,43 @@ def seed_from_archive():
     return values
 
 
+def ensure_host_key(hostname):
+    """
+    Return (private_key_text, public_key_line) for this player's pinned SSH
+    host key, generating and archiving one the first time it is needed.
+
+    Reuse across re-images is the entire point. A fresh image otherwise presents
+    a new host identity every time, so each reflash trips host key verification
+    and has to be waved through — which trains you to wave through the one
+    warning that would ever matter.
+
+    :param hostname: Player hostname, used as the archive filename and key comment.
+    """
+    directory = archive_dir()
+    os.makedirs(directory, exist_ok=True)
+    private_path = os.path.join(directory, f"{hostname}.hostkey")
+    public_path = private_path + ".pub"
+
+    if not os.path.exists(private_path):
+        subprocess.run(
+            ("ssh-keygen", "-t", "ed25519", "-N", "", "-C", hostname,
+             "-f", private_path),
+            check=True, capture_output=True, text=True,
+        )
+        print(f"  Generated SSH host key for {hostname}")
+    else:
+        print(f"  Reusing archived SSH host key for {hostname}")
+
+    os.chmod(private_path, 0o600)
+
+    with open(private_path) as f:
+        private_text = f.read()
+    with open(public_path) as f:
+        public_text = f.read().strip()
+
+    return private_text, public_text
+
+
 def save_archive_copy(player_env_path, hostname):
     """Keep a copy of the finished player.env, keyed by hostname."""
     directory = archive_dir()
@@ -254,6 +291,20 @@ def load_user_data(path):
     else:
         yaml_content = content
     return yaml.safe_load(yaml_content) or {}
+
+
+def _literal_block_str(dumper, data):
+    """Emit multi-line strings as YAML literal blocks instead of escaped one-liners."""
+    if "\n" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+
+# Without this the embedded provision.sh and the PEM-formatted host key are both
+# dumped as single enormous \n-escaped strings, leaving user-data unreadable and
+# undiffable. Semantics are identical either way; PyYAML falls back to quoting
+# automatically for any string a literal block cannot represent exactly.
+yaml.add_representer(str, _literal_block_str)
 
 
 def save_user_data(path, data):
@@ -364,6 +415,22 @@ def patch(data, hostname, multi_output, player_type="snapcast"):
         changed.append("Added runcmd: /usr/local/bin/provision.sh")
 
     data["runcmd"] = existing_runcmd
+
+    # ── ssh_keys: pin the host identity across re-images ──────────────────────
+    # Raspberry Pi OS ships regenerate_ssh_host_keys.service, which wipes and
+    # regenerates host keys on first boot. It is ConditionFirstBoot=yes and runs
+    # at sysinit, so cloud-init's cc_ssh stage lands afterwards and wins; the
+    # pinned key is then baked into the image before the overlay is enabled.
+    private_key, public_key = ensure_host_key(hostname)
+    data["ssh_keys"] = {
+        "ed25519_private": private_key,
+        "ed25519_public": public_key,
+    }
+    # Only ed25519, so there is exactly one host identity that can ever be
+    # presented. Leaving RSA and ECDSA to be generated per-image would mean a
+    # client that happened to record one of those still sees a changed key.
+    data["ssh_genkeytypes"] = ["ed25519"]
+    changed.append("Pinned SSH host key (ed25519)")
 
     # ── power_state: reboot cleanly after runcmd completes ────────────────────
     if "power_state" not in data:
