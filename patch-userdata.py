@@ -341,11 +341,35 @@ def patch(data, hostname, multi_output, player_type="snapcast"):
                         if "player.env" not in str(c)
                         and "time-wait-sync" not in str(c)]
     if len(filtered_bootcmd) != len(existing_bootcmd):
-        if filtered_bootcmd:
-            data["bootcmd"] = filtered_bootcmd
-        else:
-            data.pop("bootcmd", None)
         changed.append("Removed legacy bootcmd entries")
+
+    # ── Neutralise the dpkg lock race before anything can trigger it ──────────
+    # Debian's apt-daily timers are Persistent=true, so they fire shortly after
+    # first boot and hold /var/lib/dpkg/lock-frontend. The package install in
+    # runcmd then loses the race and fails, and because a failed runcmd does not
+    # stop the ones after it, provisioning carries on without any of its packages
+    # and dies later somewhere unrelated-looking.
+    #
+    # This goes in bootcmd, not runcmd: bootcmd runs in cloud-init's init stage,
+    # well before runcmd in the final stage, so the timers are masked before they
+    # can start. Only the timers are masked, never a running apt-daily.service —
+    # killing one mid-transaction risks leaving dpkg needing --configure -a.
+    # DPkg::Lock::Timeout in runcmd waits out any run already in flight.
+    #
+    # Masking is permanent by design. On an overlay-root appliance unattended
+    # upgrades achieve nothing: everything they install is discarded at the next
+    # reboot, at the cost of SD writes and bandwidth. These players are updated
+    # by re-imaging, not in place.
+    mask_apt_timers = ("systemctl mask --now "
+                       "apt-daily.timer apt-daily-upgrade.timer")
+    if not any("apt-daily" in str(c) for c in filtered_bootcmd):
+        filtered_bootcmd.append(mask_apt_timers)
+        changed.append("Masked apt-daily timers in bootcmd (dpkg lock race)")
+
+    if filtered_bootcmd:
+        data["bootcmd"] = filtered_bootcmd
+    else:
+        data.pop("bootcmd", None)
 
     # ── packages: remove player packages (moved to runcmd) ────────────────────
     # Keeping packages here causes cloud-init to run apt during the config phase
@@ -389,25 +413,40 @@ def patch(data, hostname, multi_output, player_type="snapcast"):
     existing_runcmd = data.get("runcmd", [])
 
     time_sync_cmd = "systemctl start systemd-time-wait-sync.service"
-    apt_update = "apt-get update"
+    # DPkg::Lock::Timeout makes apt wait for the dpkg lock rather than failing
+    # outright. Debian's apt-daily timers fire during first boot and hold it,
+    # which otherwise breaks the install intermittently — and since a failed
+    # runcmd does not stop the ones after it, provisioning carries on without
+    # the player package and fails much later with an unrelated-looking error.
+    apt_lock = "-o DPkg::Lock::Timeout=600"
+    apt_update = f"apt-get {apt_lock} update"
     player_pkg = "shairport-sync" if player_type == "airplay" else "snapclient"
-    apt_install = f"apt-get install -y --fix-missing {player_pkg} alsa-utils avahi-daemon vim sox"
+    apt_install = (f"apt-get {apt_lock} install -y --fix-missing "
+                   f"{player_pkg} alsa-utils avahi-daemon vim sox")
+
+    # Match on the verb rather than a literal "apt-get update" substring: the
+    # commands carry an -o flag between the two words, so substring matching
+    # silently stops recognising our own entries and duplicates them.
+    def has_apt(verb):
+        return any("apt-get" in str(c) and verb in str(c) for c in existing_runcmd)
+
+    def apt_index(verb):
+        return next((i for i, c in enumerate(existing_runcmd)
+                     if "apt-get" in str(c) and verb in str(c)), 0)
 
     if not any("time-wait-sync" in str(c) for c in existing_runcmd):
         existing_runcmd.insert(0, time_sync_cmd)
         changed.append("Added NTP time-sync wait to runcmd")
 
-    if not any("apt-get update" in str(c) for c in existing_runcmd):
+    if not has_apt("update"):
         idx = next((i for i, c in enumerate(existing_runcmd)
                     if "time-wait-sync" in str(c)), 0)
         existing_runcmd.insert(idx + 1, apt_update)
         changed.append("Added apt-get update to runcmd")
 
     if not any(player_pkg in str(c) for c in existing_runcmd) and \
-       not any("apt-get install" in str(c) for c in existing_runcmd):
-        idx = next((i for i, c in enumerate(existing_runcmd)
-                    if "apt-get update" in str(c)), 0)
-        existing_runcmd.insert(idx + 1, apt_install)
+       not has_apt("install"):
+        existing_runcmd.insert(apt_index("update") + 1, apt_install)
         changed.append(f"Added apt-get install ({player_pkg}) to runcmd")
 
     if not any("provision.sh" in str(c) for c in existing_runcmd):
