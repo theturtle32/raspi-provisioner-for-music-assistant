@@ -179,9 +179,42 @@ to the speaker than your reference device.
 |------|-------------|
 | `builtin` | Built-in `wlan0` (default). Installs a NM dispatcher for automatic reconnection. |
 | `usb` | USB adapter on `wlan1`. Binds the WiFi profile to `wlan1`, sets `wlan0` as unmanaged. Requires the adapter to be plugged in before first boot. |
-| `none` | WiFi disabled entirely (ethernet only). Uses `rfkill` to block all WiFi. |
+| `none` | WiFi disabled entirely (ethernet only). `rfkill` for the current boot, plus `dtoverlay=disable-wifi` in `config.txt` so it persists. |
 
-All modes install NetworkManager config for infinite reconnection retries.
+All modes install NetworkManager config for infinite reconnection retries and
+disable WiFi power save globally (`wifi.powersave=2` in a `conf.d` drop-in).
+Power save is set globally rather than per-connection because these profiles are
+regenerated into `/run` by netplan on every boot, so a `nmcli connection modify`
+setting does not reliably survive.
+
+`builtin` and `usb` also install the network watchdog described below.
+
+> **Prefer `builtin` unless you have a specific reason not to.** Cheap USB
+> adapters based on the MT7601U chipset are common and unreliable: clone units
+> ship with an invalid EEPROM, which the `mt7601u` driver reports as a kernel
+> `WARNING` in `s6_validate` at probe time and which leaves the radio running on
+> garbage TX-power calibration. They wedge at the firmware level after hours or
+> days, and no amount of NetworkManager retrying will recover them. A giveaway is
+> a MAC address whose OUI is unregistered with the IEEE. Both the onboard Pi 3
+> radio and the MT7601U are 2.4 GHz-only, so the dongle buys no extra capability.
+
+### Network watchdog
+
+NetworkManager's retry logic only helps when the radio still answers. When WiFi
+firmware wedges, the interface can stay nominally associated while passing no
+traffic — NM never emits a `down` event, and the player is dead until someone
+power-cycles it.
+
+`player-netwatch.service` pings the default gateway every 30 s and escalates:
+
+| Consecutive failures | Elapsed | Action |
+|---|---|---|
+| 1 | 30 s | Capture a journal excerpt to the boot partition |
+| 2 | 1 min | Bounce the NetworkManager connection |
+| 6 | 3 min | Reload the WiFi driver module |
+| 12 | 6 min | Reboot |
+
+Tunable in `/etc/default/player-net`.
 
 ---
 
@@ -215,11 +248,50 @@ read-only via `raspi-config overlayfs`. Steps in order:
    saves state to `asound.state` on the boot partition.
 3. **ALSA restore service** — installs `alsa-restore-boot.service` to replay
    the saved state on every subsequent boot (before snapclient starts).
-4. **Network** — applies WiFi mode config and NM reconnection dispatcher.
-5. **Startup chime** — installs a one-shot service that plays three ascending
+4. **Network** — applies WiFi mode config, NM reconnection dispatcher, global
+   power-save-off drop-in, and the network watchdog.
+5. **Clock persistence** — installs save/restore units that keep the system
+   clock on the boot partition. The Pi has no RTC and the overlay reverts
+   `fake-hwclock`, so without this every boot starts at the date the card was
+   imaged until NTP catches up, misdating all early-boot log lines.
+6. **Startup chime** — installs a one-shot service that plays three ascending
    tones on the first post-provisioning boot, confirming audio is working.
-6. **Journald** — sets `Storage=volatile` so logs go to RAM, not the SD card.
-7. **Overlay FS** — enables read-only root filesystem via `raspi-config`.
+7. **Journald** — sets `Storage=volatile` so logs go to RAM, not the SD card.
+8. **Passwordless sudo** — for the provisioned user.
+9. **Version stamp** — writes `/etc/provisioner-version` and
+   `provisioner-version` on the boot partition.
+10. **Overlay FS** — enables read-only root filesystem via `raspi-config`.
+
+If any step fails the script aborts **before** enabling the overlay, so the card
+stays writable, and writes `provision-failed.txt` to the boot partition with the
+failing line number and the last 200 log lines.
+
+---
+
+## Diagnosing a player that fell off the network
+
+The root filesystem is a RAM overlay and journald is volatile, so **a reboot
+destroys all evidence of why the reboot was needed**. Three things on the boot
+partition survive — read them before power-cycling anything:
+
+| File | Contents |
+|------|----------|
+| `netlog.txt` | Watchdog events and a journal excerpt captured at the moment each fault was detected. Size-capped at 256 KB. |
+| `provisioner-version` | Which provisioner revision built this card. |
+| `provision-failed.txt` | Present only if provisioning itself failed. |
+
+Useful checks on a running player:
+
+```bash
+cat /etc/provisioner-version            # which revision built this card?
+sudo tail -50 /boot/firmware/netlog.txt # what did the watchdog see?
+systemctl status player-netwatch        # is the watchdog running?
+dmesg | grep -iE 'wlan|WARNING'         # driver complaints at probe time
+cat /proc/net/wireless                  # signal level and discarded packets
+```
+
+Note that timestamps from before NTP sync will read as the date the card was
+imaged unless `player-clock-restore.service` ran.
 
 ---
 

@@ -8,6 +8,8 @@ Usage:
 
 What it does:
   1. Prompts for player config and writes /boot/firmware/player.env
+     (including PROVISIONER_VERSION, so a running player can report which
+     revision built it)
   2. Patches Imager's user-data:
        - Sets hostname: snapplayer-<room> directly
        - Removes legacy bootcmd entries from previous runs (idempotent)
@@ -28,6 +30,7 @@ provision.sh must be in the same directory as this script.
 import sys
 import os
 import shutil
+import subprocess
 import yaml
 
 # Known HAT overlays — maps a short name to (dtoverlay, disable_onboard_audio)
@@ -38,6 +41,36 @@ HAT_OVERLAYS = {
     "hifiberry-dacplus": ("hifiberry-dacplus",  True),
     "none":              None,
 }
+
+
+def provisioner_version():
+    """
+    Return an identifier for the provisioner revision building this card.
+
+    A dirty working tree is marked as such: a card written from uncommitted
+    changes is otherwise indistinguishable from one built at the recorded
+    commit, which makes "does this player have fix X?" unanswerable later.
+
+    Returns "unknown" outside a git checkout.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    def git(*args):
+        return subprocess.run(("git", "-C", script_dir) + args,
+                              capture_output=True, text=True, timeout=10)
+
+    try:
+        rev = git("rev-parse", "--short", "HEAD")
+        if rev.returncode != 0:
+            return "unknown"
+        version = rev.stdout.strip()
+
+        status = git("status", "--porcelain")
+        if status.returncode == 0 and status.stdout.strip():
+            version += "-dirty"
+        return version
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 def load_provision_sh():
@@ -342,6 +375,18 @@ def create_player_env(path, boot_partition):
     if hat != "none":
         lines.append(f"HAT_OVERLAY={hat}")
 
+    # ── Provisioner version stamp ─────────────────────────────────────────────
+    version = provisioner_version()
+    lines.append(f"PROVISIONER_VERSION={version}")
+    if version.endswith("-dirty"):
+        print("\n  WARNING: the provisioner working tree has uncommitted changes.")
+        print("           This card will be stamped as "
+              f"'{version}' — commit before imaging")
+        print("           if you want the revision to mean anything later.")
+    elif version == "unknown":
+        print("\n  WARNING: could not determine the provisioner git revision.")
+        print("           This card will be stamped 'unknown'.")
+
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"  Written: {path}")
@@ -398,6 +443,7 @@ def main():
         print(f"  + {c}")
 
     print(f"\nAll done.")
+    print(f"  Provisioner version: {provisioner_version()}")
     print(f"  Hostname will be: {hostname}")
     print(f"  Eject the card, insert into Pi, and power on.")
     print(f"  After ~90 seconds '{hostname}' will appear in Music Assistant.")
