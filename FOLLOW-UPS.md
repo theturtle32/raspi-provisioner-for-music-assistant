@@ -133,6 +133,48 @@ dropping the 2712 kernel means the card can never move to a Pi 5):
 
 ---
 
+## Diagnosing a WiFi player: distinguishing signatures
+
+Four different causes produced or could produce the same user-visible symptom —
+"the player dropped off and never came back". They are distinguishable, and
+`netlog.txt` captures the counters needed to tell them apart, because it records
+`/proc/net/wireless` and the interface state at the moment a fault is detected.
+
+| Cause | Signature |
+|---|---|
+| **Wedged radio firmware** (the MT7601U failure) | Nominally associated but passing nothing; `misc`/discard counters climbing; kernel warnings at probe. Only a driver reload or power cycle recovers it. |
+| **Power save** | Drops after *idle* periods, retry counts near zero. `brcmf_cfg80211_set_power_mgmt: power save enabled` in dmesg with no matching `disabled` line afterwards. |
+| **RF interference** (e.g. a class-D amp HAT near the antenna) | Correlates with *playback*, not idle. Rising `retry` and `missed beacon` while audio runs. |
+| **Upstream / mesh backhaul** | Interface UP, still associated, strong signal, zero retries — but the gateway is unreachable. Nothing is wrong locally. |
+
+The last two have opposite correlations (playback vs idle), which is the
+cheapest discriminator available.
+
+Baseline for comparison, measured on the bedroom player on onboard `wlan0`
+while the amp was actively driving audio: **-29 dBm, retry 0, missed beacon 0,
+all discards 0**. The MT7601U dongle by contrast accumulated 110 discards while
+close to idle.
+
+### Deferred: teach the watchdog to tell local from upstream
+
+`player-netwatch` decides everything from one test — can it ping the default
+gateway. An upstream outage (mesh backhaul down, router rebooting) is therefore
+indistinguishable from a dead radio, and the watchdog escalates through
+reconnect → driver reload → reboot, none of which can help. The self-reboot cap
+bounds it at three, so it is noisy rather than dangerous.
+
+Fix: a second target. Add `WATCHDOG_PEER` to `player.env` — typically the AP's
+own IP:
+
+- gateway unreachable, **peer reachable** → upstream problem; log and keep
+  watching, do not reload the driver or reboot
+- **neither** reachable → local problem; escalate as now
+
+~20 lines. Worth building if the UniFi controller history shows the mesh uplink
+actually flapping; otherwise it is machinery for a hypothetical.
+
+---
+
 ## Network watchdog recovery is unexercised
 
 **Status:** known gap.
@@ -152,9 +194,10 @@ reconnect rung, but not the driver reload.
 - **`players/` holds private SSH host keys.** Gitignored, so it exists only on
   the machine that images cards. Losing it means the next reflash of a player
   mints a new host identity. It needs to be in whatever gets backed up.
-- **Other players may still be on MT7601U dongles.** They will fail the way the
-  bedroom one did — see the MT7601U warning in the README. Before reflashing
-  each, import its current host key into `players/<hostname>.hostkey`, otherwise
-  its identity changes once.
+- **All other players are on ethernet.** Only the bedroom player is wireless —
+  and it is the only one that has ever failed. Keep that correlation in mind
+  before blaming the Pi. If a wired player is ever moved to WiFi, import its
+  current host key into `players/<hostname>.hostkey` first, or its identity
+  changes once.
 - **Changing `WIFI_MODE` changes the MAC**, and therefore the Snapcast client
   ID, and therefore requires re-associating the player in Music Assistant.
