@@ -140,6 +140,24 @@ sshq "sudo systemctl reboot" 2>/dev/null || true
 sleep 15
 wait_for_host "${TARGET}" 240 || die "${TARGET} did not come back after reboot 2"
 
+# ── Let the player settle ─────────────────────────────────────────────────────
+# The TIMESYNC_WAIT gate holds the player in "activating" until the clock syncs,
+# so a snapshot taken straight after boot reports a transient state as if it were
+# the final one — indistinguishable from a player that genuinely failed to start.
+step "Waiting for the player to finish starting"
+
+settle_elapsed=0
+while [ "$settle_elapsed" -lt 120 ]; do
+    pending=$(sshq "systemctl list-units --no-legend --state=activating 'snapclient*' 'shairport-sync*' 2>/dev/null | awk '{print \$1}' | tr '\n' ' '" 2>/dev/null || true)
+    pending=$(printf '%s' "$pending" | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')
+    [ -z "$pending" ] && break
+    info "still activating: ${pending} (clock gate holds until NTP syncs)"
+    sleep 5
+    settle_elapsed=$((settle_elapsed + 5))
+done
+[ "$settle_elapsed" -ge 120 ] && info "WARNING: still activating after 120s — check the gate"
+info "settled after ${settle_elapsed}s"
+
 # ── Verify ────────────────────────────────────────────────────────────────────
 step "Verifying"
 
