@@ -462,6 +462,7 @@ service file), re-enable overlay FS, reboot.
 patch-userdata.py     — Run on Mac/PC to prepare the SD card
 provision.sh          — Runs on the Pi at first boot (embedded into user-data)
 reprovision.sh        — Re-runs provisioning on a live player over SSH, no re-imaging
+FOLLOW-UPS.md         — Deferred ideas and known gaps
 player.env.example    — Annotated example of all player.env keys
 players/              — Per-player archive: config for seeding after a re-image,
                         plus the pinned SSH host key. Gitignored, created on
