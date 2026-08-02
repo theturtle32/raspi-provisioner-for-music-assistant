@@ -411,6 +411,19 @@ It pushes `players/<hostname>.env` if one exists, and always rewrites
 `PROVISIONER_VERSION` on the card — otherwise the version stamp would keep
 reporting the revision the card was originally imaged with.
 
+`provision.sh` clears its own mode-dependent config before writing new config
+(`reset_stale_config`), so a re-run cannot leave behind the artifacts of settings
+that are no longer selected. This matters most for `WIFI_MODE`: without it,
+switching `usb` → `builtin` would leave both `99-ignore-wlan0.conf` and
+`99-ignore-wlan1.conf` in place, marking **both** radios unmanaged and taking the
+player off the network with no way back except a console or a reflash. It also
+means `TIMESYNC_WAIT=0` and `NTP_SERVER=default` now actually take effect on a
+re-run rather than silently leaving the previous settings.
+
+Only paths `provision.sh` authors are cleared. Files it always writes identically
+— the sudoers drop-in, the clock units, the chime — are deliberately left alone,
+as is operational state on the boot partition (`netlog.txt`, `clock.save`).
+
 **What it cannot change**, because these are applied by `patch-userdata.py` at
 image time rather than by `provision.sh`:
 

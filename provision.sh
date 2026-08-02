@@ -154,6 +154,87 @@ esac
 echo "Config: player=${PLAYER_TYPE} wifi=${WIFI_MODE} multi=${MULTI_OUTPUT} ma_host=${MA_HOST}"
 echo "Provisioner version: ${PROVISIONER_VERSION}"
 
+# ══ CONVERGENCE ════════════════════════════════════════════════════════════════
+# This script is now routinely re-run in place (see reprovision.sh), not only on
+# a freshly imaged card. Writing new config without first clearing what a
+# previous run wrote leaves behind the artifacts of settings no longer selected,
+# and some of those combinations are actively harmful: WIFI_MODE=usb followed by
+# WIFI_MODE=builtin would leave both 99-ignore-wlan0.conf and 99-ignore-wlan1.conf
+# in place, marking BOTH radios unmanaged and taking the player off the network
+# with no way back except a console or a reflash.
+#
+# So remove the mode-dependent artifacts up front, then write whatever the
+# current configuration calls for.
+#
+# Only files this script authors are listed, so nothing belonging to the base
+# system is ever at risk. Files this script always writes identically — the
+# sudoers drop-in, the clock units, the chime — are deliberately NOT reset:
+# clearing them buys nothing and would leave the box degraded if a later step
+# failed. Removing the sudoers drop-in in particular would cost the passwordless
+# sudo that reprovision.sh depends on to get back in.
+#
+# Anything mode-dependent added to this script must be added here too.
+STALE_PATHS="
+/etc/default/snapclient
+/etc/default/player-net
+/etc/shairport-sync.conf
+/etc/systemd/system/player-netwatch.service
+/etc/NetworkManager/conf.d/99-ignore-wlan0.conf
+/etc/NetworkManager/conf.d/99-ignore-wlan1.conf
+/etc/NetworkManager/dispatcher.d/99-wifi-bgscan-disable.sh
+/etc/NetworkManager/dispatcher.d/99-wifi-reconnect.sh
+/etc/systemd/timesyncd.conf.d/99-local-ntp.conf
+/etc/udev/rules.d/70-disable-builtin-wifi.rules
+/etc/udev/rules.d/90-usb-audio.rules
+/usr/local/bin/player-netwatch.sh
+/usr/local/bin/wait-for-timesync.sh
+"
+
+reset_stale_config() {
+    echo "Clearing mode-dependent config from any previous run..."
+
+    # Disable before removing, so the .wants symlink goes with the unit instead
+    # of being left dangling.
+    systemctl disable player-netwatch.service >/dev/null 2>&1 || true
+
+    # Per-room units from a previous MULTI_OUTPUT layout: the room names may
+    # have changed, so stale units would keep running against dead card IDs.
+    local unit_path unit
+    for unit_path in /etc/systemd/system/snapclient-*.service; do
+        [ -e "$unit_path" ] || continue
+        unit=$(basename "$unit_path")
+        systemctl disable "$unit" >/dev/null 2>&1 || true
+        rm -f "$unit_path"
+        echo "  Removed stale unit: ${unit}"
+    done
+
+    # The player units themselves are packaged; only the drop-ins are ours.
+    rm -rf /etc/systemd/system/snapclient.service.d \
+           /etc/systemd/system/shairport-sync.service.d
+    rm -rf /etc/systemd/system/snapclient-*.service.d
+
+    # Drop enablement of both players, so switching PLAYER_TYPE does not leave
+    # the previous daemon starting on every boot. Whichever one is selected is
+    # re-enabled below.
+    systemctl disable snapclient >/dev/null 2>&1 || true
+    systemctl disable shairport-sync >/dev/null 2>&1 || true
+
+    local path
+    for path in $STALE_PATHS; do
+        rm -f "$path"
+    done
+
+    # WIFI_MODE=none appends this to the boot partition, which survives
+    # everything, so switching back to a radio mode has to strip it explicitly.
+    if [ -f "${BOOT_PART}/config.txt" ]; then
+        sed -i -e '/^dtoverlay=disable-wifi$/d' -e '/^# WIFI_MODE=none/d' \
+            "${BOOT_PART}/config.txt"
+    fi
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    echo "  Cleared."
+}
+
 # ══ DEPENDENCY PREFLIGHT ═══════════════════════════════════════════════════════
 # cloud-init's runcmd installs these before this script runs, but a failed
 # runcmd does not stop the ones after it. Without this assertion a failed apt
@@ -1240,7 +1321,11 @@ else
         avahi-daemon:avahi-daemon sox:sox
 fi
 
-# 2. Configure audio routing and player daemon
+# 2. Clear mode-dependent config from any previous run, so re-running cannot
+#    leave the artifacts of settings that are no longer selected
+reset_stale_config
+
+# 3. Configure audio routing and player daemon
 if [ "${PLAYER_TYPE}" = "airplay" ]; then
     setup_airplay
 elif [ "${MULTI_OUTPUT}" = "true" ]; then
@@ -1249,21 +1334,21 @@ else
     setup_single_output
 fi
 
-# 3. Set all cards to max volume and persist ALSA state to boot partition
+# 4. Set all cards to max volume and persist ALSA state to boot partition
 configure_alsa
 
-# 4. Configure network interface preference, reconnection and watchdog
+# 5. Configure network interface preference, reconnection and watchdog
 configure_network
 
-# 5. Point the clock at a fast NTP source and gate the player on it.
+# 6. Point the clock at a fast NTP source and gate the player on it.
 #    After configure_network so 'gateway' auto-detection has a default route.
 configure_time_sync
 install_timesync_gate
 
-# 6. Persist the clock across reboots (no RTC + overlay FS)
+# 7. Persist the clock across reboots (no RTC + overlay FS)
 configure_clock_persistence
 
-# 7. Install startup chime (plays once on first post-provisioning boot)
+# 8. Install startup chime (plays once on first post-provisioning boot)
 if [ "${MULTI_OUTPUT}" = "true" ]; then
     first_room_raw=$(grep "^OUTPUT_1_ROOM=" "$BOOT_ENV_CLEAN" | cut -d= -f2 | tr -d '"') || true
     first_room_slug=$(echo "${first_room_raw}" | tr '[:upper:]' '[:lower:]' | tr ' _' '-' | tr -cd 'a-z0-9-')
@@ -1272,19 +1357,19 @@ else
     install_startup_chime "${AUDIO_DEVICE}"
 fi
 
-# 8. Logs to RAM only
+# 9. Logs to RAM only
 configure_journald
 
-# 9. Passwordless sudo for the provisioned user
+# 10. Passwordless sudo for the provisioned user
 configure_passwordless_sudo
 
-# 10. Leave the pinned ed25519 key as the only SSH host identity
+# 11. Leave the pinned ed25519 key as the only SSH host identity
 prune_unpinned_host_keys
 
-# 11. Record which revision built this card
+# 12. Record which revision built this card
 write_version_stamp
 
-# 12. Restore /etc/issue and notify before reboot
+# 13. Restore /etc/issue and notify before reboot
 printf 'Raspbian GNU/Linux \\n \\l\n' > /etc/issue
 wall $'\n*** PROVISIONING COMPLETE — rebooting now. ***\nThis is expected and normal.\n' 2>/dev/null || true
 printf '\n\n*** PROVISIONING COMPLETE — rebooting now. ***\n\n' > /dev/tty1 2>/dev/null || true
@@ -1292,7 +1377,7 @@ printf '\n\n*** PROVISIONING COMPLETE — rebooting now. ***\n\n' > /dev/tty1 2>
 rm -f "${BOOT_PART}/provision-failed.txt" 2>/dev/null || true
 sync 2>/dev/null || true
 
-# 13. Enable overlay filesystem — must be last step before reboot
+# 14. Enable overlay filesystem — must be last step before reboot
 echo "Enabling overlay filesystem..."
 raspi-config nonint enable_overlayfs
 
