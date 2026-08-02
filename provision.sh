@@ -101,6 +101,12 @@ USB_VENDOR_ID="${USB_VENDOR_ID:-0d8c}"
 USB_PRODUCT_ID="${USB_PRODUCT_ID:-0008}"
 HAT_OVERLAY="${HAT_OVERLAY:-none}"
 PROVISIONER_VERSION="${PROVISIONER_VERSION:-unknown}"
+NTP_SERVER="${NTP_SERVER:-gateway}"
+TIMESYNC_WAIT="${TIMESYNC_WAIT:-45}"
+
+# Filled in by configure_time_sync once 'gateway' has been resolved to an
+# address, so the version stamp records what was actually configured.
+NTP_SERVER_RESOLVED=""
 
 # Populated by whichever setup_* function runs. The startup chime has to finish
 # with the sound card before these start, or they race it for the device.
@@ -129,6 +135,21 @@ fi
 validate_choice PLAYER_TYPE  "$PLAYER_TYPE"  snapcast airplay
 validate_choice WIFI_MODE    "$WIFI_MODE"    builtin usb none
 validate_choice MULTI_OUTPUT "$MULTI_OUTPUT" true false
+
+case "$TIMESYNC_WAIT" in
+    ''|*[!0-9]*)
+        echo "ERROR: TIMESYNC_WAIT='${TIMESYNC_WAIT}' is not a whole number of seconds."
+        exit 1
+        ;;
+esac
+
+# Hostname/IP charset only — this value is written into a config file.
+case "$NTP_SERVER" in
+    *[!A-Za-z0-9.:_-]*)
+        echo "ERROR: NTP_SERVER='${NTP_SERVER}' contains invalid characters."
+        exit 1
+        ;;
+esac
 
 echo "Config: player=${PLAYER_TYPE} wifi=${WIFI_MODE} multi=${MULTI_OUTPUT} ma_host=${MA_HOST}"
 echo "Provisioner version: ${PROVISIONER_VERSION}"
@@ -655,6 +676,109 @@ EOF
     echo "  Network watchdog installed for ${iface} (log: ${BOOT_PART}/netlog.txt)"
 }
 
+# ══ TIME SYNC ══════════════════════════════════════════════════════════════════
+# The Pi has no RTC, so the clock is wrong from boot until NTP lands. Debian's
+# default pool is across the WAN and can be slow or unreachable — one boot here
+# took 24 minutes, the first attempt having timed out — and the clock then steps
+# forward mid-session. Snapcast schedules every chunk against a server-relative
+# timestamp, so a large step while a player is running breaks its time sync and
+# playback stops until the client is restarted, with the control connection
+# staying up throughout so the player still looks healthy.
+#
+# A LAN source makes sync near-instant, and the gate below keeps the player from
+# starting before it happens.
+configure_time_sync() {
+    echo "Configuring time sync (NTP_SERVER=${NTP_SERVER})..."
+
+    case "$NTP_SERVER" in
+        default|none)
+            echo "  Leaving systemd-timesyncd on its packaged defaults."
+            return 0
+            ;;
+    esac
+
+    local server="$NTP_SERVER"
+    if [ "$server" = "gateway" ]; then
+        server=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}') || true
+        if [ -z "$server" ]; then
+            echo "  WARNING: NTP_SERVER=gateway but no default route was found."
+            echo "           Leaving timesyncd defaults in place."
+            return 0
+        fi
+        echo "  Resolved gateway to ${server}"
+    fi
+
+    mkdir -p /etc/systemd/timesyncd.conf.d
+    cat > /etc/systemd/timesyncd.conf.d/99-local-ntp.conf <<EOF
+[Time]
+NTP=${server}
+# Retained deliberately: a single LAN server is a single point of failure, and
+# timesyncd falls back automatically if it stops answering.
+FallbackNTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org 2.debian.pool.ntp.org
+EOF
+
+    systemctl restart systemd-timesyncd 2>/dev/null || true
+    NTP_SERVER_RESOLVED="$server"
+    echo "  timesyncd pointed at ${server} (Debian pool retained as fallback)."
+}
+
+# Gate the player on a synchronised clock — and nothing else.
+#
+# Deliberately NOT done by enabling systemd-time-wait-sync.service: that unit is
+# TimeoutStartSec=infinity and gates time-sync.target, which also orders
+# cloud-final.service (the stage that runs this script) and several maintenance
+# timers. On a network that cannot reach NTP, enabling it means provisioning
+# never finishes and the player never starts, with no timeout to recover.
+#
+# An ExecStartPre on the player unit affects only the player, is bounded, and
+# always succeeds — a player that never comes up is a worse failure than one
+# running on a slightly wrong clock.
+install_timesync_gate() {
+    if [ "$TIMESYNC_WAIT" -eq 0 ]; then
+        echo "  TIMESYNC_WAIT=0 — player will not wait for clock sync."
+        return 0
+    fi
+
+    if [ -z "$PLAYER_UNITS" ]; then
+        echo "  WARNING: no player units recorded; skipping clock-sync gate."
+        return 0
+    fi
+
+    cat > /usr/local/bin/wait-for-timesync.sh <<'GATE'
+#!/bin/bash
+# Bounded wait for NTP synchronisation. Installed by provision.sh.
+# Always exits 0 — this defers the player, it never prevents it starting.
+limit="${1:-45}"
+case "$limit" in
+    ''|*[!0-9]*) exit 0 ;;
+esac
+[ "$limit" -gt 0 ] || exit 0
+
+elapsed=0
+while [ "$elapsed" -lt "$limit" ]; do
+    if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ]; then
+        exit 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+
+echo "wait-for-timesync: clock still unsynchronised after ${limit}s; starting anyway" >&2
+exit 0
+GATE
+    chmod +x /usr/local/bin/wait-for-timesync.sh
+
+    local unit
+    for unit in $PLAYER_UNITS; do
+        mkdir -p "/etc/systemd/system/${unit}.d"
+        cat > "/etc/systemd/system/${unit}.d/20-wait-timesync.conf" <<EOF
+[Service]
+ExecStartPre=/usr/local/bin/wait-for-timesync.sh ${TIMESYNC_WAIT}
+EOF
+    done
+    echo "  Clock-sync gate installed (max ${TIMESYNC_WAIT}s) for: ${PLAYER_UNITS}"
+}
+
 # ══ CLOCK PERSISTENCE ══════════════════════════════════════════════════════════
 # The Pi has no RTC, and the overlay means fake-hwclock's own data file is
 # reverted to its image-bake value on every boot. Left alone, every boot starts
@@ -1037,6 +1161,8 @@ write_version_stamp() {
         echo "audio_device: ${AUDIO_DEVICE}"
         echo "latency_ms:   ${SNAPCLIENT_LATENCY:-0}"
         echo "sound_cards:  ${cards}"
+        echo "ntp_server:   ${NTP_SERVER_RESOLVED:-${NTP_SERVER}}"
+        echo "timesync_wait:${TIMESYNC_WAIT}"
     } > /etc/provisioner-version
     cp /etc/provisioner-version "$stamp" 2>/dev/null || true
     echo "Version stamp written: ${PROVISIONER_VERSION} (cards: ${cards})"
@@ -1076,10 +1202,15 @@ configure_alsa
 # 3. Configure network interface preference, reconnection and watchdog
 configure_network
 
-# 4. Persist the clock across reboots (no RTC + overlay FS)
+# 4. Point the clock at a fast NTP source and gate the player on it.
+#    After configure_network so 'gateway' auto-detection has a default route.
+configure_time_sync
+install_timesync_gate
+
+# 5. Persist the clock across reboots (no RTC + overlay FS)
 configure_clock_persistence
 
-# 5. Install startup chime (plays once on first post-provisioning boot)
+# 6. Install startup chime (plays once on first post-provisioning boot)
 if [ "${MULTI_OUTPUT}" = "true" ]; then
     first_room_raw=$(grep "^OUTPUT_1_ROOM=" "$BOOT_ENV_CLEAN" | cut -d= -f2 | tr -d '"') || true
     first_room_slug=$(echo "${first_room_raw}" | tr '[:upper:]' '[:lower:]' | tr ' _' '-' | tr -cd 'a-z0-9-')
@@ -1088,19 +1219,19 @@ else
     install_startup_chime "${AUDIO_DEVICE}"
 fi
 
-# 6. Logs to RAM only
+# 7. Logs to RAM only
 configure_journald
 
-# 7. Passwordless sudo for the provisioned user
+# 8. Passwordless sudo for the provisioned user
 configure_passwordless_sudo
 
-# 8. Leave the pinned ed25519 key as the only SSH host identity
+# 9. Leave the pinned ed25519 key as the only SSH host identity
 prune_unpinned_host_keys
 
-# 9. Record which revision built this card
+# 10. Record which revision built this card
 write_version_stamp
 
-# 10. Restore /etc/issue and notify before reboot
+# 11. Restore /etc/issue and notify before reboot
 printf 'Raspbian GNU/Linux \\n \\l\n' > /etc/issue
 wall $'\n*** PROVISIONING COMPLETE — rebooting now. ***\nThis is expected and normal.\n' 2>/dev/null || true
 printf '\n\n*** PROVISIONING COMPLETE — rebooting now. ***\n\n' > /dev/tty1 2>/dev/null || true
@@ -1108,7 +1239,7 @@ printf '\n\n*** PROVISIONING COMPLETE — rebooting now. ***\n\n' > /dev/tty1 2>
 rm -f "${BOOT_PART}/provision-failed.txt" 2>/dev/null || true
 sync 2>/dev/null || true
 
-# 11. Enable overlay filesystem — must be last step before reboot
+# 12. Enable overlay filesystem — must be last step before reboot
 echo "Enabling overlay filesystem..."
 raspi-config nonint enable_overlayfs
 

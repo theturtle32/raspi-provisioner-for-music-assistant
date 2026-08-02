@@ -87,6 +87,8 @@ shown in brackets when re-running against an already-configured card.
 | `AUDIO_DEVICE` | ALSA device string, or `auto` to detect the first non-built-in card |
 | `SNAPCLIENT_LATENCY` | Latency offset in ms (snapcast only; see [Latency tuning](#latency-tuning)) |
 | `WIFI_MODE` | `builtin` (default), `usb`, or `none` |
+| `NTP_SERVER` | `gateway` (default), an IP/hostname, or `default` |
+| `TIMESYNC_WAIT` | Seconds the player waits for clock sync (default `45`, `0` disables) |
 | `HAT_OVERLAY` | Optional audio HAT; adds `dtoverlay` to `config.txt` |
 
 See `player.env.example` for a fully annotated example.
@@ -219,6 +221,39 @@ power-cycles it.
 | 12 | 6 min | Reboot |
 
 Tunable in `/etc/default/player-net`.
+
+---
+
+## Clock and time sync
+
+The Pi has no RTC, so its clock is wrong from boot until NTP lands — and
+Snapcast schedules every audio chunk against a server-relative timestamp. If the
+clock steps while a player is running, its time sync breaks and playback stops,
+*while the control connection stays up*, so the player still appears healthy in
+Music Assistant with the volume responding. On one boot here Debian's pool timed
+out and sync only arrived 24 minutes later.
+
+Two independent settings, both in `player.env`:
+
+| Key | Default | Effect |
+|-----|---------|--------|
+| `NTP_SERVER` | `gateway` | `gateway` auto-detects the default route (your router). Or an IP/hostname, or `default` to leave Debian's pool alone. |
+| `TIMESYNC_WAIT` | `45` | Seconds the player waits for a synchronised clock before starting. `0` disables. |
+
+`NTP_SERVER` writes a `timesyncd.conf.d` drop-in and **always keeps the Debian
+pool as `FallbackNTP`** — a single LAN server is a single point of failure, and
+timesyncd switches over automatically if it stops answering. A router typically
+replies in tens of milliseconds rather than seconds, so sync lands almost
+immediately at boot.
+
+`TIMESYNC_WAIT` installs an `ExecStartPre` on the player unit only. It is
+**deliberately not** implemented by enabling `systemd-time-wait-sync.service`:
+that unit is `TimeoutStartSec=infinity` and gates `time-sync.target`, which also
+orders `cloud-final.service` — the stage that runs `provision.sh` — plus several
+maintenance timers. On a network that cannot reach NTP, enabling it means
+provisioning never finishes and the player never starts, with no timeout to
+recover. The `ExecStartPre` is bounded and always exits 0, so a dead NTP server
+delays the player instead of silencing it, and nothing else boots any slower.
 
 ---
 

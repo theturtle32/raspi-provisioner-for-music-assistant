@@ -574,6 +574,22 @@ def create_player_env(path, boot_partition):
     if wifi_mode == "usb":
         print("  NOTE: USB WiFi adapter must be plugged in before first boot.")
 
+    # ── Clock / time sync ─────────────────────────────────────────────────────
+    print("\n  Clock (the Pi has no RTC — a late NTP step breaks Snapcast sync):")
+    print("    gateway  — auto-detect your router (default; usually answers in ms)")
+    print("    default  — leave Debian's NTP pool alone (WAN, can be slow)")
+    print("    <ip>     — an explicit NTP server address")
+    ntp_server = prompt("NTP_SERVER", existing.get("NTP_SERVER", "gateway"))
+    lines.append(f"NTP_SERVER={ntp_server}")
+
+    timesync_wait = prompt(
+        "TIMESYNC_WAIT — seconds the player waits for clock sync (0 = don't wait)",
+        existing.get("TIMESYNC_WAIT", "45"))
+    if not timesync_wait.isdigit():
+        print(f"    '{timesync_wait}' is not a whole number — using 45")
+        timesync_wait = "45"
+    lines.append(f"TIMESYNC_WAIT={timesync_wait}")
+
     # ── HAT selection ─────────────────────────────────────────────────────────
     print("\n  Audio HAT (optional — adds dtoverlay to config.txt)")
     print("  Options: " + ", ".join(HAT_OVERLAYS.keys()))
