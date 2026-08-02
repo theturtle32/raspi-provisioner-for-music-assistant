@@ -392,6 +392,40 @@ ssh <host> "sudo cat /etc/ssh/ssh_host_ed25519_key.pub" > players/<hostname>.hos
 chmod 600 players/<hostname>.hostkey
 ```
 
+### Re-provisioning without re-imaging
+
+Most `provision.sh` changes do not need a new card. `reprovision.sh` re-runs
+provisioning on a live player over SSH:
+
+```bash
+./reprovision.sh snapplayer-primary-bedroom.local
+```
+
+The only thing standing in the way of an in-place re-run is the RAM overlay,
+which discards everything `provision.sh` writes. So the script turns the overlay
+off, reboots, runs the current `provision.sh` (which re-enables the overlay as
+its last step), and reboots again. Two reboots, a couple of minutes, no card
+handling and no ~2.7 GB image write.
+
+It pushes `players/<hostname>.env` if one exists, and always rewrites
+`PROVISIONER_VERSION` on the card — otherwise the version stamp would keep
+reporting the revision the card was originally imaged with.
+
+**What it cannot change**, because these are applied by `patch-userdata.py` at
+image time rather than by `provision.sh`:
+
+- `HAT_OVERLAY` — writes `dtoverlay=` into `config.txt`
+- the pinned SSH host key, the hostname, and the cloud-init `user-data`
+
+Changing `WIFI_MODE` *is* possible but changes which NIC is used, and therefore
+the MAC, and therefore the Snapcast client ID — the player will need
+re-associating in Music Assistant. See [SSH host keys](#ssh-host-keys) for the
+same caveat applied to host identity.
+
+If `provision.sh` fails, the script stops and prints `provision-failed.txt`. The
+overlay is left **off** and the card writable, which is the right state for
+investigating.
+
 ### After re-imaging a card
 
 Writing a fresh image with Raspberry Pi Imager rewrites the boot partition, so
@@ -414,6 +448,7 @@ service file), re-enable overlay FS, reboot.
 ```
 patch-userdata.py     — Run on Mac/PC to prepare the SD card
 provision.sh          — Runs on the Pi at first boot (embedded into user-data)
+reprovision.sh        — Re-runs provisioning on a live player over SSH, no re-imaging
 player.env.example    — Annotated example of all player.env keys
 players/              — Per-player archive: config for seeding after a re-image,
                         plus the pinned SSH host key. Gitignored, created on
