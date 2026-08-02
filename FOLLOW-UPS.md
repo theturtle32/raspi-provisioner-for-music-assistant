@@ -70,20 +70,38 @@ revisiting if the manifest is ever found stale in practice.
 
 ---
 
-## Music Assistant reassigns clients to a standalone group
+## Music Assistant reassigns clients to a standalone group on reconnect
 
-**Status:** observed twice, cause unconfirmed, possibly an upstream MA bug.
+**Status:** CONFIRMED and reproducible. Upstream Music Assistant bug — nothing
+the provisioner can fix. Worth reporting.
 
-After a power-cycle and again after a `systemctl restart snapclient`, the
-bedroom player ended up alone in its own Snapcast group pointed at the idle
-`default` stream, while the other players stayed in the playing sync group. The
-player looks completely healthy — connected, unmuted, volume responsive — and is
-simply never sent audio.
+**Any snapclient reconnect** pulls the player out of its sync group and into a
+brand-new standalone group pointed at the idle `default` stream. The player then
+looks completely healthy — connected, unmuted, volume responsive, MAC unchanged
+— and is simply never sent audio. From the client side all you see is
+`(Stream) No chunks available`, which is also the normal idle message.
 
-Re-adding it in the MA UI fixes it.
+Observed three times on 2026-08-01, each following a reconnect:
 
-**Next time it happens, capture the server state BEFORE touching the player** —
-this is read-only and would have identified it in seconds:
+| Trigger | Resulting group |
+|---|---|
+| Power-cycle | (not captured — evidence destroyed by restarting the client) |
+| `systemctl restart snapclient` | `a0fe8636` |
+| snapclient restart after a routing change | `ec98cc5f` |
+
+The group ID differs each time, so MA **creates a new group** rather than
+reusing a stale one. The client MAC is unchanged throughout
+(`b8:27:eb:d3:3e:b4`), so this is not an identity problem — see the SSH host key
+section of the README for why identity is stable across re-imaging.
+
+**Consequence:** every reboot risks dropping the player out of its sync group.
+That includes `reprovision.sh` runs and any `player-netwatch` self-reboot.
+
+**Fix:** re-add the player to the sync group in the MA UI. Avoid pushing it
+directly with `Group.SetClients` — MA owns these groups and will likely undo it.
+
+**Diagnose before touching anything.** This is read-only and identifies it in
+seconds; restarting the client destroys the evidence:
 
 ```bash
 curl -s -H 'Content-Type: application/json' \
@@ -91,9 +109,8 @@ curl -s -H 'Content-Type: application/json' \
   http://<MA_HOST>:1780/jsonrpc | python3 -m json.tool | grep -E 'stream_id|status|name'
 ```
 
-A restart of the client destroys the evidence, so diagnose first. If the pattern
-holds — reconnect leads to a standalone group on the idle stream — it is an MA
-reconciliation bug worth reporting upstream. Nothing the provisioner can fix.
+A player in a group whose `stream_id` is `default` while another group's stream
+is `playing` is this bug, not a player fault.
 
 ---
 
