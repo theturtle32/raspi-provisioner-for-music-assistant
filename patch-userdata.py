@@ -382,7 +382,7 @@ def patch(data, hostname, multi_output, player_type="snapcast"):
             data["packages"] = remaining_pkgs
         else:
             data.pop("packages", None)
-        changed.append("Moved player packages to runcmd (uses --fix-missing)")
+        changed.append("Moved player packages to runcmd")
 
     # ── write_files: always update provision.sh from disk ─────────────────────
     existing_wf = data.get("write_files", [])
@@ -421,7 +421,12 @@ def patch(data, hostname, multi_output, player_type="snapcast"):
     apt_lock = "-o DPkg::Lock::Timeout=600"
     apt_update = f"apt-get {apt_lock} update"
     player_pkg = "shairport-sync" if player_type == "airplay" else "snapclient"
-    apt_install = (f"apt-get {apt_lock} install -y --fix-missing "
+    # No --fix-missing: it tells apt to hold back any package it cannot retrieve
+    # and carry on, so a mirror hiccup exits 0 having installed nothing. That
+    # turns a missing player package into a silent failure that only surfaces
+    # much later, as an unrelated-looking "Unit does not exist" from systemctl.
+    # Better for apt to fail loudly at the point the problem actually occurs.
+    apt_install = (f"apt-get {apt_lock} install -y "
                    f"{player_pkg} alsa-utils avahi-daemon vim sox")
 
     # Match on the verb rather than a literal "apt-get update" substring: the
