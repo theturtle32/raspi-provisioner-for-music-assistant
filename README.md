@@ -280,26 +280,34 @@ implemented: Merus Audio amp limiter bypass (prevents clipping at high volumes).
 Runs once on first boot via cloud-init `runcmd`, then the filesystem is locked
 read-only via `raspi-config overlayfs`. Steps in order:
 
-1. **Audio routing** — writes `/etc/default/snapclient` (single-output) or
+1. **Dependency preflight** — asserts the packages cloud-init's `runcmd` was
+   meant to install actually arrived, and aborts naming any that did not. A
+   failed `runcmd` does not stop the ones after it, so without this a failed
+   `apt` surfaces much later as `Unit snapclient.service does not exist` — an
+   error nowhere near the cause. It only checks; it never installs.
+2. **Audio routing** — writes `/etc/default/snapclient` (single-output) or
    per-room systemd service files (multi-output), or `shairport-sync.conf`
    (AirPlay).
-2. **ALSA volume** — sets all mixer controls to 100%, runs HAT-specific tuning,
+3. **ALSA volume** — sets all mixer controls to 100%, runs HAT-specific tuning,
    saves state to `asound.state` on the boot partition.
-3. **ALSA restore service** — installs `alsa-restore-boot.service` to replay
+4. **ALSA restore service** — installs `alsa-restore-boot.service` to replay
    the saved state on every subsequent boot (before snapclient starts).
-4. **Network** — applies WiFi mode config, NM reconnection dispatcher, global
+5. **Network** — applies WiFi mode config, NM reconnection dispatcher, global
    power-save-off drop-in, and the network watchdog.
-5. **Clock persistence** — installs save/restore units that keep the system
+6. **Time sync** — points `timesyncd` at `NTP_SERVER` and installs the
+   `TIMESYNC_WAIT` gate on the player unit. See
+   [Clock and time sync](#clock-and-time-sync).
+7. **Clock persistence** — installs save/restore units that keep the system
    clock on the boot partition. The Pi has no RTC and the overlay reverts
    `fake-hwclock`, so without this every boot starts at the date the card was
    imaged until NTP catches up, misdating all early-boot log lines.
-6. **Startup chime** — installs a one-shot service that plays three ascending
+8. **Startup chime** — installs a one-shot service that plays three ascending
    tones on the first post-provisioning boot, confirming audio is working.
-7. **Journald** — sets `Storage=volatile` so logs go to RAM, not the SD card.
-8. **Passwordless sudo** — for the provisioned user.
-9. **Version stamp** — writes `/etc/provisioner-version` and
+9. **Journald** — sets `Storage=volatile` so logs go to RAM, not the SD card.
+10. **Passwordless sudo** — for the provisioned user.
+11. **Version stamp** — writes `/etc/provisioner-version` and
    `provisioner-version` on the boot partition.
-10. **Overlay FS** — enables read-only root filesystem via `raspi-config`.
+12. **Overlay FS** — enables read-only root filesystem via `raspi-config`.
 
 If any step fails the script aborts **before** enabling the overlay, so the card
 stays writable, and writes `provision-failed.txt` to the boot partition with the

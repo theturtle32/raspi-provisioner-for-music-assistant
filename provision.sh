@@ -154,6 +154,48 @@ esac
 echo "Config: player=${PLAYER_TYPE} wifi=${WIFI_MODE} multi=${MULTI_OUTPUT} ma_host=${MA_HOST}"
 echo "Provisioner version: ${PROVISIONER_VERSION}"
 
+# ══ DEPENDENCY PREFLIGHT ═══════════════════════════════════════════════════════
+# cloud-init's runcmd installs these before this script runs, but a failed
+# runcmd does not stop the ones after it. Without this assertion a failed apt
+# surfaces much later as "Unit snapclient.service does not exist" from systemctl
+# enable — an error pointing nowhere near the cause, with the real apt failure
+# buried in a different log.
+#
+# This only asserts. It deliberately does not install anything: repairing a step
+# this script does not own would duplicate the package list, and installing just
+# the player while alsa-utils and sox stayed missing would report success and
+# then fail later anyway, further from the cause than before.
+have_command() {
+    local cmd="$1"
+    command -v "$cmd" >/dev/null 2>&1 && return 0
+    # amixer/alsactl/avahi-daemon live in sbin, which may be off PATH.
+    [ -x "/usr/sbin/${cmd}" ] || [ -x "/sbin/${cmd}" ]
+}
+
+require_commands() {
+    local missing="" entry cmd pkg
+    for entry in "$@"; do
+        cmd="${entry%%:*}"
+        pkg="${entry##*:}"
+        if ! have_command "$cmd"; then
+            missing="${missing}  ${cmd} (package: ${pkg})"$'\n'
+        fi
+    done
+
+    if [ -n "$missing" ]; then
+        echo "ERROR: commands this script depends on are not installed:"
+        printf '%s' "$missing"
+        echo
+        echo "cloud-init's runcmd was supposed to install these before running"
+        echo "provision.sh. A failed runcmd does not abort the ones after it, so"
+        echo "provisioning got this far regardless. The real failure — most often"
+        echo "apt losing the dpkg lock or failing to reach a mirror — will be in:"
+        echo "    /var/log/cloud-init-output.log"
+        exit 1
+    fi
+    echo "All required commands present."
+}
+
 # ══ HELPERS ════════════════════════════════════════════════════════════════════
 
 set_card_max_volume() {
@@ -1187,7 +1229,18 @@ configure_journald() {
 # Note: hostname and /etc/hosts are handled by cloud-init (user-data bootcmd
 # + manage_etc_hosts: true) before this script runs. No set_hostname() needed.
 
-# 1. Configure audio routing and player daemon
+# 1. Assert the packages cloud-init was meant to install actually arrived
+if [ "${PLAYER_TYPE}" = "airplay" ]; then
+    require_commands shairport-sync:shairport-sync \
+        amixer:alsa-utils aplay:alsa-utils alsactl:alsa-utils \
+        avahi-daemon:avahi-daemon sox:sox
+else
+    require_commands snapclient:snapclient \
+        amixer:alsa-utils aplay:alsa-utils alsactl:alsa-utils \
+        avahi-daemon:avahi-daemon sox:sox
+fi
+
+# 2. Configure audio routing and player daemon
 if [ "${PLAYER_TYPE}" = "airplay" ]; then
     setup_airplay
 elif [ "${MULTI_OUTPUT}" = "true" ]; then
@@ -1196,21 +1249,21 @@ else
     setup_single_output
 fi
 
-# 2. Set all cards to max volume and persist ALSA state to boot partition
+# 3. Set all cards to max volume and persist ALSA state to boot partition
 configure_alsa
 
-# 3. Configure network interface preference, reconnection and watchdog
+# 4. Configure network interface preference, reconnection and watchdog
 configure_network
 
-# 4. Point the clock at a fast NTP source and gate the player on it.
+# 5. Point the clock at a fast NTP source and gate the player on it.
 #    After configure_network so 'gateway' auto-detection has a default route.
 configure_time_sync
 install_timesync_gate
 
-# 5. Persist the clock across reboots (no RTC + overlay FS)
+# 6. Persist the clock across reboots (no RTC + overlay FS)
 configure_clock_persistence
 
-# 6. Install startup chime (plays once on first post-provisioning boot)
+# 7. Install startup chime (plays once on first post-provisioning boot)
 if [ "${MULTI_OUTPUT}" = "true" ]; then
     first_room_raw=$(grep "^OUTPUT_1_ROOM=" "$BOOT_ENV_CLEAN" | cut -d= -f2 | tr -d '"') || true
     first_room_slug=$(echo "${first_room_raw}" | tr '[:upper:]' '[:lower:]' | tr ' _' '-' | tr -cd 'a-z0-9-')
@@ -1219,19 +1272,19 @@ else
     install_startup_chime "${AUDIO_DEVICE}"
 fi
 
-# 7. Logs to RAM only
+# 8. Logs to RAM only
 configure_journald
 
-# 8. Passwordless sudo for the provisioned user
+# 9. Passwordless sudo for the provisioned user
 configure_passwordless_sudo
 
-# 9. Leave the pinned ed25519 key as the only SSH host identity
+# 10. Leave the pinned ed25519 key as the only SSH host identity
 prune_unpinned_host_keys
 
-# 10. Record which revision built this card
+# 11. Record which revision built this card
 write_version_stamp
 
-# 11. Restore /etc/issue and notify before reboot
+# 12. Restore /etc/issue and notify before reboot
 printf 'Raspbian GNU/Linux \\n \\l\n' > /etc/issue
 wall $'\n*** PROVISIONING COMPLETE — rebooting now. ***\nThis is expected and normal.\n' 2>/dev/null || true
 printf '\n\n*** PROVISIONING COMPLETE — rebooting now. ***\n\n' > /dev/tty1 2>/dev/null || true
@@ -1239,7 +1292,7 @@ printf '\n\n*** PROVISIONING COMPLETE — rebooting now. ***\n\n' > /dev/tty1 2>
 rm -f "${BOOT_PART}/provision-failed.txt" 2>/dev/null || true
 sync 2>/dev/null || true
 
-# 12. Enable overlay filesystem — must be last step before reboot
+# 13. Enable overlay filesystem — must be last step before reboot
 echo "Enabling overlay filesystem..."
 raspi-config nonint enable_overlayfs
 
