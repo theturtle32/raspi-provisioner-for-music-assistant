@@ -161,14 +161,18 @@ info "settled after ${settle_elapsed}s"
 # ── Verify ────────────────────────────────────────────────────────────────────
 step "Verifying"
 
+# Player units are enumerated rather than named: a channel-split or multi-output
+# player runs snapclient-<room>.service instead of the packaged snapclient, so a
+# fixed list would report nothing at all about the players that actually exist.
 sshq "
     printf '    overlay:  %s\n' \"\$(grep -o 'overlayroot=[a-z]*' /proc/cmdline || echo 'NOT ACTIVE')\"
     printf '    version:  %s\n' \"\$(grep -s '^version:' /etc/provisioner-version | awk '{print \$2}')\"
     printf '    wifi:     %s\n' \"\$(ip -br addr show wlan0 2>/dev/null | awk '{print \$1, \$2, \$3}')\"
-    for s in snapclient shairport-sync player-netwatch; do
+    players=\$(systemctl list-unit-files --no-legend 'snapclient*.service' 'shairport-sync.service' 2>/dev/null | awk '{print \$1}')
+    for s in \$players player-netwatch; do
         st=\$(systemctl is-active \$s 2>/dev/null)
         [ \"\$st\" = inactive ] && continue
-        printf '    %-16s %s\n' \"\$s\" \"\$st\"
+        printf '    %-36s %s\n' \"\$s\" \"\$st\"
     done
     if sudo test -f /boot/firmware/provision-failed.txt; then
         echo '    WARNING: provision-failed.txt is present'

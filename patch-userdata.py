@@ -94,6 +94,20 @@ def provisioner_version():
 
 ARCHIVE_DIRNAME = "players"
 
+# How many players one Pi runs, and where their audio goes. Stored in player.env
+# as two independent booleans rather than one key, because that is the shape
+# provision.sh reads and the shape older cards already carry.
+OUTPUT_MODES = ("single", "split", "multi")
+
+
+def existing_output_mode(existing):
+    """Which output mode a previously written player.env describes."""
+    if existing.get("MULTI_OUTPUT", "false").lower() == "true":
+        return "multi"
+    if existing.get("CHANNEL_SPLIT", "false").lower() == "true":
+        return "split"
+    return "single"
+
 
 def archive_dir():
     """Directory holding a copy of every player.env this script has written."""
@@ -282,6 +296,21 @@ def prompt(label, default=None):
             print("    (required)")
 
 
+def prompt_optional(label, default=""):
+    """
+    Like prompt(), but a blank answer is a legitimate one.
+
+    Enter still keeps an existing value, so re-running against a configured card
+    does not quietly drop it; clearing a value therefore needs to be explicit,
+    which is what '-' is for.
+    """
+    shown = f" [{default}]" if default else ""
+    value = input(f"  {label}{shown}: ").strip()
+    if value == "-":
+        return ""
+    return value if value else default
+
+
 def load_user_data(path):
     with open(path, "r") as f:
         content = f.read()
@@ -321,7 +350,7 @@ def derive_hostname(room_name):
     return "snapplayer-" + slug
 
 
-def patch(data, hostname, multi_output, player_type="snapcast"):
+def patch(data, hostname, player_type="snapcast"):
     """Patch user-data dict in place. Returns list of change descriptions."""
     changed = []
 
@@ -500,8 +529,15 @@ def create_player_env(path, boot_partition):
 
     print("  (Press Enter to keep existing value shown in brackets)\n")
 
-    multi = prompt("Multi-output device? (true/false)",
-                   existing.get("MULTI_OUTPUT", "false")).lower()
+    print("  Output mode:")
+    print("    single  — one player on one sound card (default)")
+    print("    split   — two mono players, one per channel of a single stereo")
+    print("              card, for two rooms with a single speaker each")
+    print("    multi   — several USB DACs on a hub, one player each")
+    mode = prompt("Output mode", existing_output_mode(existing)).lower()
+    if mode not in OUTPUT_MODES:
+        print(f"    '{mode}' is not an output mode — using single")
+        mode = "single"
 
     ma_host = prompt("MA_HOST (Music Assistant server IP)",
                      existing.get("MA_HOST", "192.168.3.42"))
@@ -511,7 +547,67 @@ def create_player_env(path, boot_partition):
     if player_type not in ("snapcast", "airplay"):
         player_type = "snapcast"
 
-    if multi == "true":
+    # provision.sh refuses this combination too, but there is no reason to let a
+    # card be written that cannot boot into what was asked for.
+    if mode == "split" and player_type == "airplay":
+        sys.exit(
+            "\nERROR: split mode is only implemented for PLAYER_TYPE=snapcast.\n"
+            "       Two shairport-sync instances would each need their own port\n"
+            "       and mDNS identity; see FOLLOW-UPS.md."
+        )
+
+    if mode == "split":
+        room_name = prompt(
+            "ROOM_NAME (labels the box, and gives it its hostname)",
+            existing.get("ROOM_NAME", ""))
+        print("\n  Each zone below becomes a separate player in Music Assistant.")
+        print("  Left is the first channel of the card. Leave a zone blank if")
+        print("  nothing is wired to that channel yet — adding it later is one")
+        print("  reprovision.sh run and does not disturb the other zone.")
+        print("  ('-' clears a zone that was configured before.)")
+        left_room = prompt_optional("LEFT_ROOM (player name for the left channel)",
+                                    existing.get("LEFT_ROOM", ""))
+        right_room = prompt_optional("RIGHT_ROOM (player name for the right channel)",
+                                     existing.get("RIGHT_ROOM", ""))
+        if not left_room and not right_room:
+            print("    A split with no zones is not a player — name at least one.")
+            left_room = prompt("LEFT_ROOM (player name for the left channel)")
+
+        left_latency = "0"
+        if left_room:
+            left_latency = prompt("LEFT_LATENCY in ms (0 = no offset)",
+                                  existing.get("LEFT_LATENCY", "0"))
+        right_latency = "0"
+        if right_room:
+            right_latency = prompt("RIGHT_LATENCY in ms (0 = no offset)",
+                                   existing.get("RIGHT_LATENCY", "0"))
+        audio = prompt("AUDIO_DEVICE", existing.get("AUDIO_DEVICE", "auto"))
+        print("\n  Each zone hears the whole mix, both channels summed to mono.")
+        print("  MONO_MIX_GAIN is applied to each half of that sum: 0.5 cannot")
+        print("  clip, 1.0 is 6 dB louder and will clip centre-panned material.")
+        gain = prompt("MONO_MIX_GAIN", existing.get("MONO_MIX_GAIN", "0.5"))
+
+        lines = [
+            "# Player provisioning config",
+            f"MA_HOST={ma_host}",
+            f"PLAYER_TYPE={player_type}",
+            "CHANNEL_SPLIT=true",
+            f'ROOM_NAME="{room_name}"',
+            f"AUDIO_DEVICE={audio}",
+            f"MONO_MIX_GAIN={gain}",
+        ]
+        # An unconfigured zone is an absent key rather than an empty one, so the
+        # file says what it means when read by hand later.
+        if left_room:
+            lines.append(f'LEFT_ROOM="{left_room}"')
+            if left_latency != "0":
+                lines.append(f"LEFT_LATENCY={left_latency}")
+        if right_room:
+            lines.append(f'RIGHT_ROOM="{right_room}"')
+            if right_latency != "0":
+                lines.append(f"RIGHT_LATENCY={right_latency}")
+
+    elif mode == "multi":
         vendor  = prompt("USB_VENDOR_ID", existing.get("USB_VENDOR_ID", "0d8c"))
         product = prompt("USB_PRODUCT_ID", existing.get("USB_PRODUCT_ID", "0008"))
         outputs = []
@@ -619,7 +715,7 @@ def create_player_env(path, boot_partition):
         f.write("\n".join(lines) + "\n")
     print(f"  Written: {path}")
 
-    return room_name, multi == "true", hat, player_type
+    return room_name, mode, hat, player_type
 
 
 def main():
@@ -642,10 +738,10 @@ def main():
         sys.exit(1)
 
     # ── player.env first — we need room_name to derive hostname ───────────────
-    room_name, multi_output, hat, player_type = create_player_env(
+    room_name, output_mode, hat, player_type = create_player_env(
         player_env_path, boot_partition)
 
-    if multi_output:
+    if output_mode == "multi":
         hostname = "snapplayer-multi"
     else:
         hostname = derive_hostname(room_name)
@@ -671,7 +767,7 @@ def main():
         print(f"\nBacked up original user-data → user-data.bak")
 
     data = load_user_data(user_data_path)
-    data, changes = patch(data, hostname, multi_output, player_type)
+    data, changes = patch(data, hostname, player_type)
     save_user_data(user_data_path, data)
 
     print(f"\nPatched: {user_data_path}")
@@ -682,7 +778,13 @@ def main():
     print(f"  Provisioner version: {provisioner_version()}")
     print(f"  Hostname will be: {hostname}")
     print(f"  Eject the card, insert into Pi, and power on.")
-    print(f"  After ~90 seconds '{hostname}' will appear in Music Assistant.")
+    if output_mode == "split":
+        print("  After ~90 seconds each configured zone appears in Music")
+        print("  Assistant as its own player. The startup chime plays on the")
+        print("  zones in channel order, left first — that is how you tell which")
+        print("  speaker is which without tracing the wiring.")
+    else:
+        print(f"  After ~90 seconds '{hostname}' will appear in Music Assistant.")
 
 
 if __name__ == "__main__":

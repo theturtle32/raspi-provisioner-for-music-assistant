@@ -10,6 +10,12 @@
 #   snapcast  — snapclient connecting to MA's Snapcast server
 #   airplay   — shairport-sync appearing as AirPlay device in MA
 #
+# Output layout is one of three, and they are mutually exclusive:
+#   single           — one player on one sound card (default)
+#   CHANNEL_SPLIT    — one stereo card driving two independent mono players,
+#                      one per physical channel (a room with a single speaker)
+#   MULTI_OUTPUT     — several USB DACs on a hub, one player per card
+#
 # WIFI_MODE in player.env controls WiFi interface selection:
 #   builtin   — use built-in wlan0 (default)
 #   usb       — use USB adapter wlan1, disable built-in wlan0
@@ -94,9 +100,15 @@ source "$BOOT_ENV_CLEAN"
 PLAYER_TYPE="${PLAYER_TYPE:-snapcast}"
 WIFI_MODE="${WIFI_MODE:-builtin}"
 MULTI_OUTPUT="${MULTI_OUTPUT:-false}"
+CHANNEL_SPLIT="${CHANNEL_SPLIT:-false}"
 ROOM_NAME="${ROOM_NAME:-}"
 AUDIO_DEVICE="${AUDIO_DEVICE:-auto}"
 SNAPCLIENT_LATENCY="${SNAPCLIENT_LATENCY:-}"
+LEFT_ROOM="${LEFT_ROOM:-}"
+RIGHT_ROOM="${RIGHT_ROOM:-}"
+LEFT_LATENCY="${LEFT_LATENCY:-}"
+RIGHT_LATENCY="${RIGHT_LATENCY:-}"
+MONO_MIX_GAIN="${MONO_MIX_GAIN:-0.5}"
 USB_VENDOR_ID="${USB_VENDOR_ID:-0d8c}"
 USB_PRODUCT_ID="${USB_PRODUCT_ID:-0008}"
 HAT_OVERLAY="${HAT_OVERLAY:-none}"
@@ -111,6 +123,11 @@ NTP_SERVER_RESOLVED=""
 # Populated by whichever setup_* function runs. The startup chime has to finish
 # with the sound card before these start, or they race it for the device.
 PLAYER_UNITS=""
+
+# Zone devices that have a player behind them, in channel order. Only the zones
+# listed here get a chime: a chime played down a channel with no speaker on it
+# would be an unexplained silence in the middle of the sequence.
+SPLIT_CHIME_DEVICES=""
 
 # ── Validate config ────────────────────────────────────────────────────────────
 # Fail loudly on an unrecognised value. A silent fallback to the default is how
@@ -132,9 +149,77 @@ if [ -z "${MA_HOST:-}" ]; then
     exit 1
 fi
 
-validate_choice PLAYER_TYPE  "$PLAYER_TYPE"  snapcast airplay
-validate_choice WIFI_MODE    "$WIFI_MODE"    builtin usb none
-validate_choice MULTI_OUTPUT "$MULTI_OUTPUT" true false
+# A garbage latency is worse than a missing one: it lands in the player's
+# ExecStart, snapclient exits on the bad argument, and Restart=always turns that
+# into a restart loop with no audio and a unit that looks like it is merely
+# flapping rather than misconfigured.
+validate_latency() {
+    local name="$1" value="$2"
+    [ -n "$value" ] || return 0
+    if ! [[ "$value" =~ ^-?[0-9]+$ ]]; then
+        echo "ERROR: ${name}='${value}' is not a whole number of milliseconds."
+        exit 1
+    fi
+}
+
+validate_choice PLAYER_TYPE   "$PLAYER_TYPE"   snapcast airplay
+validate_choice WIFI_MODE     "$WIFI_MODE"     builtin usb none
+validate_choice MULTI_OUTPUT  "$MULTI_OUTPUT"  true false
+validate_choice CHANNEL_SPLIT "$CHANNEL_SPLIT" true false
+
+validate_latency SNAPCLIENT_LATENCY "$SNAPCLIENT_LATENCY"
+validate_latency LEFT_LATENCY       "$LEFT_LATENCY"
+validate_latency RIGHT_LATENCY      "$RIGHT_LATENCY"
+
+if [ "$CHANNEL_SPLIT" = true ]; then
+    # Both layouts want to own the whole audio path, and there is no sensible
+    # merge of "one card, two channels" with "several cards, one each".
+    if [ "$MULTI_OUTPUT" = true ]; then
+        echo "ERROR: CHANNEL_SPLIT and MULTI_OUTPUT are mutually exclusive."
+        echo "       CHANNEL_SPLIT splits one card into two mono zones;"
+        echo "       MULTI_OUTPUT gives one player per USB DAC."
+        exit 1
+    fi
+
+    # shairport-sync can be run twice, but each instance needs its own port and
+    # its own mDNS identity, and neither has ever been exercised here. Refusing
+    # is better than shipping a configuration that half works.
+    if [ "$PLAYER_TYPE" = airplay ]; then
+        echo "ERROR: CHANNEL_SPLIT is only implemented for PLAYER_TYPE=snapcast."
+        echo "       See FOLLOW-UPS.md for what an AirPlay version would involve."
+        exit 1
+    fi
+
+    # One zone is a legitimate configuration: the second speaker may not be wired
+    # yet. Split mode is still the right layout for a single speaker, because the
+    # zone sums both channels to mono — a single-output player would send it the
+    # left channel alone and lose whatever is panned right. It also means the
+    # audio path is already final, so the latency offset tuned now survives the
+    # arrival of the second zone.
+    if [ -z "$LEFT_ROOM" ] && [ -z "$RIGHT_ROOM" ]; then
+        echo "ERROR: CHANNEL_SPLIT=true requires LEFT_ROOM, RIGHT_ROOM, or both."
+        echo "       Each names one of the mono players in Music Assistant; leave"
+        echo "       one unset if that channel has nothing connected to it yet."
+        exit 1
+    fi
+
+    # Written straight into an ALSA ttable, where a non-numeric value is a parse
+    # error at open time — i.e. a player that starts and is simply silent.
+    if ! [[ "$MONO_MIX_GAIN" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "ERROR: MONO_MIX_GAIN='${MONO_MIX_GAIN}' is not a decimal number (e.g. 0.5)."
+        exit 1
+    fi
+    case "$MONO_MIX_GAIN" in
+        0|0.0|0.00|0.000)
+            echo "ERROR: MONO_MIX_GAIN='${MONO_MIX_GAIN}' would mute both zones."
+            exit 1
+            ;;
+    esac
+    if [ "${MONO_MIX_GAIN%%.*}" -gt 2 ]; then
+        echo "ERROR: MONO_MIX_GAIN='${MONO_MIX_GAIN}' is far past clipping. Use 0.5–1.0."
+        exit 1
+    fi
+fi
 
 case "$TIMESYNC_WAIT" in
     ''|*[!0-9]*)
@@ -151,7 +236,8 @@ case "$NTP_SERVER" in
         ;;
 esac
 
-echo "Config: player=${PLAYER_TYPE} wifi=${WIFI_MODE} multi=${MULTI_OUTPUT} ma_host=${MA_HOST}"
+echo "Config: player=${PLAYER_TYPE} wifi=${WIFI_MODE} multi=${MULTI_OUTPUT}" \
+     "split=${CHANNEL_SPLIT} ma_host=${MA_HOST}"
 echo "Provisioner version: ${PROVISIONER_VERSION}"
 
 # ══ CONVERGENCE ════════════════════════════════════════════════════════════════
@@ -190,6 +276,10 @@ STALE_PATHS="
 /usr/local/bin/wait-for-timesync.sh
 "
 
+# Identifies an /etc/asound.conf this script wrote, so convergence can remove
+# one it authored without touching one somebody else put there.
+ASOUND_MARKER="# Generated by provision.sh — CHANNEL_SPLIT"
+
 reset_stale_config() {
     echo "Clearing mode-dependent config from any previous run..."
 
@@ -223,6 +313,15 @@ reset_stale_config() {
     for path in $STALE_PATHS; do
         rm -f "$path"
     done
+
+    # /etc/asound.conf is system-wide ALSA config, not exclusively ours by
+    # convention, so it is only removed when it carries the marker written by
+    # write_channel_split_asound. Leaving a stale copy behind would keep the
+    # zone_* devices defined against a card layout no longer in use.
+    if [ -f /etc/asound.conf ] && grep -q "$ASOUND_MARKER" /etc/asound.conf 2>/dev/null; then
+        rm -f /etc/asound.conf
+        echo "  Removed generated /etc/asound.conf"
+    fi
 
     # WIFI_MODE=none appends this to the boot partition, which survives
     # everything, so switching back to a radio mode has to strip it explicitly.
@@ -279,6 +378,20 @@ require_commands() {
 
 # ══ HELPERS ════════════════════════════════════════════════════════════════════
 
+# Room names are operator-entered free text and end up in systemd unit names,
+# ALSA card ids and hostnames, none of which tolerate spaces or punctuation.
+#
+# Leading and trailing hyphens are trimmed as well: " kitchen" would otherwise
+# become "-kitchen", which is not a legal hostname and which `hostname` would
+# read as an option — taking the player down with it.
+slugify() {
+    echo "$1" \
+        | tr '[:upper:]' '[:lower:]' \
+        | tr ' _' '-' \
+        | tr -cd 'a-z0-9-' \
+        | sed -e 's/^-*//' -e 's/-*$//'
+}
+
 set_card_max_volume() {
     local idx="$1"
     local -a controls=(
@@ -316,7 +429,8 @@ set_all_cards_max_volume() {
     done < <(aplay -l 2>/dev/null)
 }
 
-detect_audio_device() {
+# ALSA id of the first card that is not the SoC's own audio, e.g. sndrpimerusamp.
+detect_card_name() {
     local card_name
     # `|| true` because pipefail turns "no match" from grep into a fatal error,
     # which would defeat the fallback below.
@@ -328,10 +442,28 @@ detect_audio_device() {
         | sed 's/^card [0-9]*: \([^ ]*\) .*/\1/') || true
 
     if [ -n "$card_name" ]; then
-        echo "default:CARD=${card_name}"
+        echo "$card_name"
     else
-        echo "default:CARD=Headphones"
+        echo "Headphones"
     fi
+}
+
+detect_audio_device() {
+    echo "default:CARD=$(detect_card_name)"
+}
+
+# dmix has to be handed the raw hw device. It opens the card itself and does the
+# mixing, so pointing it at `default:`/`plughw:` would stack a second conversion
+# layer in front of a plugin that is already the one doing the conversion.
+hw_device_for() {
+    local dev="$1"
+    case "$dev" in
+        hw:*)            echo "$dev" ;;
+        plughw:*)        echo "hw:${dev#plughw:}" ;;
+        default:CARD=*)  echo "hw:CARD=${dev#default:CARD=},DEV=0" ;;
+        CARD=*)          echo "hw:${dev},DEV=0" ;;
+        *)               echo "$dev" ;;
+    esac
 }
 
 # Appliance restart semantics: a player that gives up is a player someone has
@@ -349,6 +481,98 @@ Restart=always
 RestartSec=5
 EOF
     echo "  Restart=always drop-in installed for ${unit}"
+}
+
+# ══ PER-INSTANCE SNAPCLIENT UNITS ══════════════════════════════════════════════
+# Used by both layouts that run more than one player on one Pi.
+#
+# Snapcast identifies a client by MAC address, and --instance disambiguates
+# several on one host (instance 1 keeps the bare MAC, later ones get "MAC#N"), so
+# the players are distinct as far as the server is concerned. Their *displayed*
+# name is a different matter: the client reports the system hostname, which is
+# the same for every instance, so Music Assistant lists two or three identically
+# named players and nothing but trial and error says which room each one is.
+#
+# snapclient has no option for the reported name — --hostID sets the id, not the
+# name — so each instance gets its own UTS namespace with the room's hostname set
+# inside it. The host's own hostname, and therefore mDNS and SSH, is untouched.
+UNSHARE_BIN=""
+UTS_HOSTNAME_OK=""
+
+# Probed rather than assumed: a cosmetic name is not worth a player that will
+# not start, so if anything about the namespace is unavailable we fall back to a
+# plain ExecStart and the operator renames the players in MA once instead.
+uts_hostname_available() {
+    if [ -z "$UTS_HOSTNAME_OK" ]; then
+        UTS_HOSTNAME_OK=no
+        UNSHARE_BIN=$(command -v unshare 2>/dev/null) || UNSHARE_BIN=""
+        if [ -n "$UNSHARE_BIN" ] && command -v hostname >/dev/null 2>&1; then
+            local before after
+            before=$(hostname)
+            if "$UNSHARE_BIN" --uts /bin/sh -c 'hostname snapclient-uts-probe' >/dev/null 2>&1; then
+                after=$(hostname)
+                if [ "$after" = "$before" ]; then
+                    UTS_HOSTNAME_OK=yes
+                else
+                    # Cannot happen with a working --uts, but the cost of being
+                    # wrong is the box answering to the wrong name until reboot.
+                    hostname "$before" 2>/dev/null || true
+                    echo "  WARNING: unshare --uts did not isolate the hostname; not using it"
+                fi
+            fi
+        fi
+        [ "$UTS_HOSTNAME_OK" = yes ] \
+            || echo "  NOTE: per-instance player names unavailable; rename them in MA instead"
+    fi
+    [ "$UTS_HOSTNAME_OK" = yes ]
+}
+
+# write_snapclient_unit <slug> <room-name> <soundcard> <instance> <latency>
+#
+# The slug names the unit and is what the instance reports as its hostname; the
+# room name is only the unit description, so it can keep its spaces and case.
+#
+# Appends the unit to PLAYER_UNITS, so the clock-sync gate and the startup chime
+# order themselves against every player rather than just the first.
+write_snapclient_unit() {
+    local slug="$1" name="$2" soundcard="$3" instance="$4" latency="$5"
+    local unit="snapclient-${slug}.service"
+
+    local latency_opt=""
+    if [ -n "$latency" ] && [ "$latency" != "0" ]; then
+        latency_opt=" --latency ${latency}"
+    fi
+
+    # No --mixer: snapclient defaults to software volume, which is what keeps
+    # players sharing one card independently controllable. 'hardware' would have
+    # them all fighting over the same ALSA control.
+    local snapclient_args="-h ${MA_HOST} --instance ${instance} --soundcard ${soundcard}${latency_opt}"
+    local exec_start
+    if uts_hostname_available; then
+        exec_start="${UNSHARE_BIN} --uts /bin/sh -c 'hostname ${slug} && exec /usr/bin/snapclient ${snapclient_args}'"
+    else
+        exec_start="/usr/bin/snapclient ${snapclient_args}"
+    fi
+
+    cat > "/etc/systemd/system/${unit}" <<EOF
+[Unit]
+Description=Snapclient - ${name}
+After=network-online.target sound.target alsa-restore-boot.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=${exec_start}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl enable "$unit"
+    PLAYER_UNITS="${PLAYER_UNITS:+${PLAYER_UNITS} }${unit}"
+    echo "  Enabled ${unit} (instance ${instance}, device ${soundcard}${latency_opt})"
 }
 
 # ══ SINGLE-OUTPUT SETUP ════════════════════════════════════════════════════════
@@ -429,6 +653,174 @@ EOF
     PLAYER_UNITS="shairport-sync.service"
 }
 
+# ══ CHANNEL-SPLIT SETUP ════════════════════════════════════════════════════════
+# One stereo card, two independently controllable mono players — for rooms with a
+# single speaker each, wired one per amplifier channel.
+#
+# Two snapclients have to share one card, and an ALSA hw device can only be
+# opened once, so a single dmix owns the card and both zones feed into it. Each
+# zone is a route on top of that dmix which sums the incoming stereo pair into
+# one physical channel, so each room hears the whole mix rather than half of it.
+write_channel_split_asound() {
+    local hw_device="$1" gain="$2"
+
+    cat > /etc/asound.conf <<EOF
+${ASOUND_MARKER}
+#
+# Do not edit: re-running provisioning overwrites this file, and provisioning
+# removes it (recognised by the marker line above) if the layout changes.
+#
+#   zone_shared   dmix that owns ${hw_device} and mixes both zones into it
+#   zone_left     stereo in, summed to physical channel 0
+#   zone_right    stereo in, summed to physical channel 1
+#
+# ttable gain is MONO_MIX_GAIN=${gain}, applied to each leg of the downmix:
+# summing two channels at unity reaches twice full scale and clips on anything
+# centre-panned, which is most vocals. Raise it toward 1.0 for more level on a
+# quiet speaker, at the cost of headroom.
+#
+# The rate and buffer are pinned because dmix negotiates them once, when the
+# first zone opens, and every later zone is stuck with the result; leaving them
+# implicit makes the shared buffer depend on which zone happened to start first.
+# If the server ever sends another rate, the plug in front of each zone resamples
+# per zone instead. The format is deliberately left to negotiation — dmix has to
+# settle on one the card actually supports, and that varies by DAC.
+#
+# dshare would avoid the mixing altogether by handing each zone one hardware
+# channel outright, but dmix is by far the better-trodden path and all it ever
+# mixes here is the silence each zone writes into the other one's channel.
+pcm.zone_shared {
+    type dmix
+    ipc_key 3141592
+    ipc_perm 0666
+    slave {
+        pcm "${hw_device}"
+        channels 2
+        rate 48000
+        period_time 0
+        period_size 1024
+        buffer_size 8192
+    }
+}
+
+pcm.zone_left {
+    type plug
+    slave.pcm {
+        type route
+        slave.pcm "zone_shared"
+        slave.channels 2
+        ttable.0.0 ${gain}
+        ttable.1.0 ${gain}
+    }
+}
+
+pcm.zone_right {
+    type plug
+    slave.pcm {
+        type route
+        slave.pcm "zone_shared"
+        slave.channels 2
+        ttable.0.1 ${gain}
+        ttable.1.1 ${gain}
+    }
+}
+EOF
+    echo "  /etc/asound.conf written (dmix on ${hw_device}, mix gain ${gain})"
+}
+
+# Proof that the mixing chain actually opens, which a config file alone is not.
+#
+# Deliberately a warning rather than a failure: during a reprovision the player
+# from the *previous* layout is still running and still holding the card
+# exclusively, so a busy device here says nothing about how the card behaves
+# after the reboot that follows. A real failure surfaces on first boot as a
+# chime that never plays.
+verify_zone_devices() {
+    local dev
+    for dev in zone_left zone_right; do
+        if aplay -q -D "$dev" -t raw -f S16_LE -c 2 -r 48000 -d 1 /dev/zero 2>/dev/null; then
+            echo "  ${dev}: opened OK"
+        else
+            echo "  WARNING: could not open ALSA device '${dev}'."
+            echo "           Expected if a player from a previous layout still holds the card."
+            echo "           Otherwise check that the card supports 48000 Hz stereo:"
+            echo "             aplay -D ${dev} -t raw -f S16_LE -c 2 -r 48000 -d 1 /dev/zero"
+        fi
+    done
+}
+
+setup_channel_split() {
+    echo "Setting up channel-split outputs (two mono zones on one card)..."
+
+    # An unset room means that channel has nothing connected yet; its ALSA device
+    # is still defined, so wiring the speaker later is purely additive.
+    local left_slug="" right_slug=""
+    if [ -n "$LEFT_ROOM" ]; then
+        left_slug=$(slugify "$LEFT_ROOM")
+    fi
+    if [ -n "$RIGHT_ROOM" ]; then
+        right_slug=$(slugify "$RIGHT_ROOM")
+    fi
+
+    # A name reaches systemd unit paths and the hostname the instance reports, so
+    # one that survives slugify as nothing at all cannot be used.
+    if [ -n "$LEFT_ROOM" ] && [ -z "$left_slug" ]; then
+        echo "ERROR: LEFT_ROOM='${LEFT_ROOM}' contains no usable characters."
+        echo "       Use letters, digits, spaces or hyphens."
+        exit 1
+    fi
+    if [ -n "$RIGHT_ROOM" ] && [ -z "$right_slug" ]; then
+        echo "ERROR: RIGHT_ROOM='${RIGHT_ROOM}' contains no usable characters."
+        echo "       Use letters, digits, spaces or hyphens."
+        exit 1
+    fi
+    if [ -n "$left_slug" ] && [ "$left_slug" = "$right_slug" ]; then
+        echo "ERROR: LEFT_ROOM and RIGHT_ROOM both reduce to '${left_slug}'."
+        echo "       The two zones need distinguishable names."
+        exit 1
+    fi
+
+    if [ "$AUDIO_DEVICE" = "auto" ] || [ -z "$AUDIO_DEVICE" ]; then
+        echo "Auto-detecting audio device..."
+        AUDIO_DEVICE="default:CARD=$(detect_card_name)"
+        echo "  Detected: $AUDIO_DEVICE"
+    else
+        echo "  Using configured device: $AUDIO_DEVICE"
+    fi
+
+    local hw_device
+    hw_device=$(hw_device_for "$AUDIO_DEVICE")
+    case "$hw_device" in
+        hw:*) ;;
+        *) echo "  WARNING: '${hw_device}' is not a hw: device; dmix may refuse to open it" ;;
+    esac
+
+    write_channel_split_asound "$hw_device" "$MONO_MIX_GAIN"
+
+    # Instance numbers belong to the channel, not to the order the units happen to
+    # be written in. Left is 1 so it keeps the bare MAC as its Snapcast id — a
+    # player converted from single-output stays the same client in Music
+    # Assistant — and a zone added later can never renumber, and therefore never
+    # change the identity of, a player that is already in service.
+    if [ -n "$left_slug" ]; then
+        write_snapclient_unit "$left_slug" "$LEFT_ROOM" zone_left 1 "$LEFT_LATENCY"
+        SPLIT_CHIME_DEVICES="${SPLIT_CHIME_DEVICES:+${SPLIT_CHIME_DEVICES} }zone_left"
+    else
+        echo "  Left channel: no LEFT_ROOM set; zone_left is defined but has no player"
+    fi
+    if [ -n "$right_slug" ]; then
+        write_snapclient_unit "$right_slug" "$RIGHT_ROOM" zone_right 2 "$RIGHT_LATENCY"
+        SPLIT_CHIME_DEVICES="${SPLIT_CHIME_DEVICES:+${SPLIT_CHIME_DEVICES} }zone_right"
+    else
+        echo "  Right channel: no RIGHT_ROOM set; zone_right is defined but has no player"
+    fi
+
+    # The packaged unit would open the card exclusively and lock both zones out.
+    systemctl disable snapclient 2>/dev/null || true
+
+    verify_zone_devices
+}
+
 # ══ MULTI-OUTPUT SETUP ═════════════════════════════════════════════════════════
 setup_multi_output() {
     echo "Setting up multi-output device..."
@@ -447,9 +839,8 @@ setup_multi_output() {
 
         local n="${BASH_REMATCH[1]}"
         local room="$val"
-        # Sanitize room name for service names, card IDs, hostnames
         local room_slug
-        room_slug=$(echo "${room}" | tr '[:upper:]' '[:lower:]' | tr ' _' '-' | tr -cd 'a-z0-9-')
+        room_slug=$(slugify "$room")
         local port_var="OUTPUT_${n}_USB_PORT"
         local port="${!port_var:-}"
 
@@ -461,11 +852,8 @@ setup_multi_output() {
         local card_id="room_${room_slug}"
         local latency_var="OUTPUT_${n}_LATENCY"
         local latency_val="${!latency_var:-}"
-        local latency_opt=""
-        if [ -n "$latency_val" ] && [ "$latency_val" != "0" ]; then
-            latency_opt=" --latency ${latency_val}"
-        fi
-        echo "  Output $n: room=$room  usb_port=$port  card_id=$card_id${latency_opt:+  latency=${latency_val}}"
+        validate_latency "OUTPUT_${n}_LATENCY" "$latency_val"
+        echo "  Output $n: room=$room  usb_port=$port  card_id=$card_id"
 
         udev_rules+="SUBSYSTEM==\"sound\", \
 ATTRS{idVendor}==\"${vendor}\", \
@@ -473,27 +861,8 @@ ATTRS{idProduct}==\"${product}\", \
 KERNELS==\"${port}\", \
 ATTR{id}=\"${card_id}\"\n"
 
-        cat > "/etc/systemd/system/snapclient-${room_slug}.service" <<EOF
-[Unit]
-Description=Snapclient - ${room}
-After=network-online.target sound.target alsa-restore-boot.service
-Wants=network-online.target
-StartLimitIntervalSec=0
-
-[Service]
-ExecStart=/usr/bin/snapclient \\
-    -h ${MA_HOST} \\
-    --instance ${instance} \\
-    --soundcard default:CARD=${card_id}${latency_opt}
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl enable "snapclient-${room_slug}.service"
-        echo "  Enabled snapclient-${room_slug}.service"
-        PLAYER_UNITS="${PLAYER_UNITS:+${PLAYER_UNITS} }snapclient-${room_slug}.service"
+        write_snapclient_unit "$room_slug" "$room" "default:CARD=${card_id}" \
+            "$instance" "$latency_val"
         instance=$((instance + 1))
     done < "$BOOT_ENV_CLEAN"
 
@@ -1161,15 +1530,22 @@ EOF
 }
 
 # ══ STARTUP CHIME ══════════════════════════════════════════════════════════════
+# Takes one or more ALSA devices and plays the chime on each in turn. With one
+# output that is the same single confirmation as before; with channel-split zones
+# it is also how you find out which speaker is wired to which amplifier channel,
+# since nothing on the Pi can tell you that.
 install_startup_chime() {
-    local audio_device="$1"
     local flag="${BOOT_PART}/chime-played"
+    local device_list="" device
+    for device in "$@"; do
+        device_list+=" \"${device}\""
+    done
 
     cat > /usr/local/bin/startup-chime.sh <<EOF
 #!/bin/bash
 # Play a startup chime once on first post-provisioning boot, then never again.
 FLAG="${flag}"
-DEVICE="${audio_device}"
+DEVICES=(${device_list# })
 
 [ -f "\$FLAG" ] && exit 0
 
@@ -1180,7 +1556,12 @@ sox -n -r 48000 -c 2 /tmp/chime.wav \
     synth 0.22 sine 783.99 fade 0 0.22 0.08 delay 0.40 \
     gain -6 2>/dev/null
 
-aplay -D "\$DEVICE" /tmp/chime.wav 2>/dev/null
+# In configured order, with a gap: identical chimes one after another are what
+# make the order audible from a hallway.
+for device in "\${DEVICES[@]}"; do
+    aplay -D "\$device" /tmp/chime.wav 2>/dev/null
+    sleep 1
+done
 rm -f /tmp/chime.wav
 
 touch "\$FLAG"
@@ -1278,6 +1659,11 @@ write_version_stamp() {
         echo "player_type:  ${PLAYER_TYPE}"
         echo "wifi_mode:    ${WIFI_MODE}"
         echo "multi_output: ${MULTI_OUTPUT}"
+        echo "channel_split:${CHANNEL_SPLIT}"
+        if [ "$CHANNEL_SPLIT" = true ]; then
+            echo "zones:        left=${LEFT_ROOM:-(none)} right=${RIGHT_ROOM:-(none)}"
+            echo "mono_mix_gain:${MONO_MIX_GAIN}"
+        fi
         echo "room_name:    ${ROOM_NAME}"
         echo "ma_host:      ${MA_HOST}"
         echo "hat_overlay:  ${HAT_OVERLAY}"
@@ -1328,6 +1714,8 @@ reset_stale_config
 # 3. Configure audio routing and player daemon
 if [ "${PLAYER_TYPE}" = "airplay" ]; then
     setup_airplay
+elif [ "${CHANNEL_SPLIT}" = "true" ]; then
+    setup_channel_split
 elif [ "${MULTI_OUTPUT}" = "true" ]; then
     setup_multi_output
 else
@@ -1349,10 +1737,14 @@ install_timesync_gate
 configure_clock_persistence
 
 # 8. Install startup chime (plays once on first post-provisioning boot)
-if [ "${MULTI_OUTPUT}" = "true" ]; then
+if [ "${CHANNEL_SPLIT}" = "true" ]; then
+    # Left channel first, then right — the order that identifies the speakers.
+    # Deliberately unquoted: these are the fixed literals zone_left/zone_right.
+    # shellcheck disable=SC2086
+    install_startup_chime ${SPLIT_CHIME_DEVICES}
+elif [ "${MULTI_OUTPUT}" = "true" ]; then
     first_room_raw=$(grep "^OUTPUT_1_ROOM=" "$BOOT_ENV_CLEAN" | cut -d= -f2 | tr -d '"') || true
-    first_room_slug=$(echo "${first_room_raw}" | tr '[:upper:]' '[:lower:]' | tr ' _' '-' | tr -cd 'a-z0-9-')
-    install_startup_chime "default:CARD=room_${first_room_slug}"
+    install_startup_chime "default:CARD=room_$(slugify "$first_room_raw")"
 else
     install_startup_chime "${AUDIO_DEVICE}"
 fi

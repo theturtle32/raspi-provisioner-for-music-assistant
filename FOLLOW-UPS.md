@@ -114,6 +114,31 @@ is `playing` is this bug, not a player fault.
 
 ---
 
+## Channel-split for AirPlay
+
+**Status:** deliberately refused, not deferred-with-a-design.
+
+`CHANNEL_SPLIT` splits one stereo card into two independently controllable mono
+players. It is implemented for Snapcast only; `provision.sh` and
+`patch-userdata.py` both refuse `PLAYER_TYPE=airplay` with it rather than
+configuring something that half works.
+
+shairport-sync can be run twice — `-c` takes a config file per instance — but
+each instance also needs its own `general.port` and its own mDNS identity, and
+AirPlay volume is per-instance in a way that has never been exercised here. The
+ALSA half would be free: both instances point at `zone_left` / `zone_right` and
+the `dmix` underneath already handles two writers.
+
+**If built:** two config files, two units, distinct ports, and a check that both
+appear as separate AirPlay targets before believing it works.
+
+**Also unexercised:** `CHANNEL_SPLIT` combined with `MULTI_OUTPUT` — several USB
+DACs, each split in two. Refused for now; there is no sensible merge of "one
+card, two channels" and "several cards, one player each" without a per-output
+channel key, and nothing here needs eight zones on one Pi.
+
+---
+
 ## Faster flashing / slimmer base image
 
 **Status:** investigated, no good option found.
@@ -189,6 +214,28 @@ own IP:
 
 ~20 lines. Worth building if the UniFi controller history shows the mesh uplink
 actually flapping; otherwise it is machinery for a hypothetical.
+
+---
+
+## Channel-split has not run on hardware yet
+
+**Status:** known gap.
+
+The generated units, `/etc/asound.conf`, the convergence path and every
+validation refusal were exercised, but only on a machine with no sound card. What
+is unverified is the part only a real card can answer:
+
+- whether `dmix` settles on a format the card supports, with `rate`, `period_size`
+  and `buffer_size` pinned as they are
+- whether `snd_pcm_delay` through `dmix` → `route` reports accurately enough for
+  Snapcast to hold sync against the other players, and what latency offset the
+  zones end up needing
+- whether `0.5` per leg of the downmix is loud enough on a single ceiling speaker
+  with the amp already at 100%
+
+The first is self-announcing: `verify_zone_devices` warns at provisioning time,
+and on first boot the chime simply does not play. The second and third are
+tuning, not failure.
 
 ---
 

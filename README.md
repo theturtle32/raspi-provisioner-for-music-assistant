@@ -80,12 +80,14 @@ shown in brackets when re-running against an already-configured card.
 
 | Prompt | Description |
 |--------|-------------|
-| `MULTI_OUTPUT` | `true` for a USB hub with multiple DACs; `false` (default) for a single output |
+| Output mode | `single` (default), `split` for two mono zones on one card, or `multi` for several USB DACs |
 | `MA_HOST` | IP address of the Music Assistant server |
 | `PLAYER_TYPE` | `snapcast` (default) or `airplay` |
 | `ROOM_NAME` | Used for the hostname (`snapplayer-<room>`) and MA player name |
 | `AUDIO_DEVICE` | ALSA device string, or `auto` to detect the first non-built-in card |
 | `SNAPCLIENT_LATENCY` | Latency offset in ms (snapcast only; see [Latency tuning](#latency-tuning)) |
+| `LEFT_ROOM` / `RIGHT_ROOM` | Split mode only: the player name for each channel. Leave one blank if that channel has nothing wired to it yet |
+| `MONO_MIX_GAIN` | Split mode only: gain per half of the mono downmix (default `0.5`) |
 | `WIFI_MODE` | `builtin` (default), `usb`, or `none` |
 | `NTP_SERVER` | `gateway` (default), an IP/hostname, or `default` |
 | `TIMESYNC_WAIT` | Seconds the player waits for clock sync (default `45`, `0` disables) |
@@ -100,12 +102,164 @@ See `player.env.example` for a fully annotated example.
 ### Snapcast (`PLAYER_TYPE=snapcast`)
 
 Runs `snapclient` pointing at Music Assistant's built-in Snapcast server.
-Synchronized multi-room audio across all Snapcast players.
+Synchronized multi-room audio across all Snapcast players. Also the only player
+type that can serve more than one room from one Pi — see
+[channel-split](#channel-split-mode-two-mono-zones-on-one-card) and
+[multi-output](#multi-output-mode) modes.
 
 ### AirPlay (`PLAYER_TYPE=airplay`)
 
 Runs `shairport-sync`, making the Pi appear as an AirPlay device in Music
 Assistant. Useful for rooms where sync with other players is not needed.
+
+---
+
+## Channel-split mode: two mono zones on one card
+
+For two rooms that each have a *single* speaker — a pair of bathrooms with one
+in-ceiling speaker each, say — one stereo card can drive both as independently
+controllable players. The left amplifier channel feeds one room, the right feeds
+the other, and each appears in Music Assistant on its own.
+
+```
+CHANNEL_SPLIT=true
+ROOM_NAME="bathrooms"            # labels the box; hostname snapplayer-bathrooms
+LEFT_ROOM="guest bathroom"       # first channel of the card
+RIGHT_ROOM="primary bathroom"    # second channel
+MONO_MIX_GAIN=0.5
+RIGHT_LATENCY=0                  # per-zone, as with any other player
+```
+
+Snapcast only, and mutually exclusive with `MULTI_OUTPUT`; `provision.sh` refuses
+both combinations rather than picking one.
+
+### Starting with only one channel wired
+
+Name only the zone that has a speaker on it. Both ALSA devices are still defined,
+but only the named zone gets a player, so nothing phantom shows up in Music
+Assistant:
+
+```
+CHANNEL_SPLIT=true
+ROOM_NAME="guest bathroom"
+LEFT_ROOM="guest bathroom"       # RIGHT_ROOM omitted until the speaker exists
+```
+
+This is a better starting point than single-output mode even with one speaker, for
+two reasons. The zone sums both channels to mono, so that speaker hears the whole
+mix — a single-output player would send it the left channel alone and lose
+whatever is panned right. And the audio path is already final, so the latency
+offset you tune now still applies once the second zone arrives; converting from
+single-output later would insert the `dmix` buffer and shift it.
+
+Adding the second zone later is one `reprovision.sh` run. Instance numbers belong
+to the channel rather than to the order the units are written, so the zone already
+in service keeps its Snapcast id and its place in Music Assistant. At the prompts,
+leave a zone blank to leave it unconfigured, or enter `-` to clear one that was
+configured before.
+
+Before reprovisioning, you can confirm a newly wired speaker from the running
+player without changing anything — the device already exists:
+
+```bash
+speaker-test -D zone_right -c 2 -t sine -l 1
+```
+
+### Each zone hears everything, not half the stereo image
+
+A zone is not "the left channel of the music". Both incoming channels are summed
+to mono and sent to one physical output, so nothing panned to one side goes
+missing in a room. `MONO_MIX_GAIN` is the gain applied to each half of that sum:
+
+| Value | Effect |
+|-------|--------|
+| `0.5` (default) | Cannot clip. Costs 6 dB of maximum loudness. |
+| `1.0` | 6 dB louder, and clips anything centre-panned — which is most vocals. |
+
+Raise it if a speaker is too quiet with the amp already at full, and listen at
+the volume you actually use before keeping it.
+
+### How it works
+
+`provision.sh` writes `/etc/asound.conf` defining three ALSA devices:
+
+| Device | What it is |
+|--------|-----------|
+| `zone_shared` | A `dmix` that owns the card. An ALSA `hw` device can only be opened once, and two snapclients need it at the same time. |
+| `zone_left` | A `route` on top of `zone_shared` summing both incoming channels into physical channel 0. |
+| `zone_right` | The same, into physical channel 1. |
+
+Then one `snapclient-<room>.service` per zone, pointed at the matching device.
+Rate and buffer are pinned in the `dmix` slave, because `dmix` negotiates those
+once — when the first zone opens — and every later zone is stuck with the result.
+
+The file carries a marker line, and provisioning removes it only if it finds that
+marker, so an `/etc/asound.conf` you wrote yourself is never touched.
+
+### Which speaker is on which channel
+
+Nothing on the Pi can tell you, so the startup chime does: on the first
+post-provisioning boot it plays on each configured zone in channel order, left
+first, pausing a second between. Stand where you can hear both and the order tells
+you the wiring. A zone with no player configured is skipped rather than chimed
+into, so the sequence has no unexplained silences in it.
+
+### Two players, two names
+
+Snapcast identifies a client by MAC address and distinguishes instances on one
+host with `--instance`, so the two zones are distinct clients. Their *displayed*
+name is another matter: a client reports the system hostname, which is identical
+for both, so Music Assistant would list two players called
+`snapplayer-bathrooms` and nothing but trial and error would say which room each
+one is.
+
+snapclient has no option for the reported name — `--hostID` sets the id, not the
+name. So each instance is started inside its own UTS namespace with the room's
+name set as the hostname there:
+
+```
+ExecStart=/usr/bin/unshare --uts /bin/sh -c 'hostname guest-bathroom && exec /usr/bin/snapclient ...'
+```
+
+The Pi's own hostname, and therefore mDNS and SSH, is untouched. This is probed
+at provisioning time rather than assumed: if `unshare` is unavailable the units
+fall back to a plain `ExecStart` and both players show up under the box's
+hostname, to be renamed once in Music Assistant. Multi-output mode gets the same
+treatment, for the same reason.
+
+Volume stays independent per zone because snapclient's default mixer is
+`software`, so each instance scales its own samples. A `hardware` mixer would
+have both zones fighting over the one ALSA control on the shared card.
+
+### Converting an existing single-output player
+
+The left zone is deliberately instance 1, which keeps the bare MAC as its
+Snapcast id. A player converted from single-output therefore stays the *same*
+client in Music Assistant — same volume, same group membership — and only the
+second zone arrives as new. `reprovision.sh` is enough; no re-imaging:
+
+```bash
+# players/snapplayer-guest-bathroom.env — keep ROOM_NAME, add the zones
+CHANNEL_SPLIT=true
+LEFT_ROOM="guest bathroom"
+RIGHT_ROOM="primary bathroom"
+```
+
+```bash
+./reprovision.sh snapplayer-guest-bathroom.local
+```
+
+Leave `ROOM_NAME` alone while doing this. It is what the hostname was derived
+from, and the hostname is set by cloud-init at image time, so `reprovision.sh`
+cannot change it — see
+[what it cannot change](#re-provisioning-without-re-imaging). The box keeps the
+name of whichever room it was originally built for; the two *players* are named
+from `LEFT_ROOM` and `RIGHT_ROOM` regardless.
+
+Expect to want a latency offset relative to your other players: the `dmix` buffer
+sits in the path that a single-output player does not have. See
+[Latency tuning](#latency-tuning), and set `LEFT_LATENCY` / `RIGHT_LATENCY` —
+they are per-zone, though on one card they will normally be equal.
 
 ---
 
@@ -173,6 +327,10 @@ curl http://192.168.3.42:1780/jsonrpc -d '{
 |----------|---------------|
 | Merus Audio I2S amp | `-20 ms` |
 | C-Media USB DAC | `0 ms` (reference) |
+
+A channel-split box needs its own measurement rather than the value for the same
+card in single-output mode: its audio goes through a `dmix` buffer that a
+single-output player does not have.
 
 Negative values play *earlier* — use them for hardware that is natively faster
 to the speaker than your reference device.
@@ -285,9 +443,9 @@ read-only via `raspi-config overlayfs`. Steps in order:
    failed `runcmd` does not stop the ones after it, so without this a failed
    `apt` surfaces much later as `Unit snapclient.service does not exist` — an
    error nowhere near the cause. It only checks; it never installs.
-2. **Audio routing** — writes `/etc/default/snapclient` (single-output) or
-   per-room systemd service files (multi-output), or `shairport-sync.conf`
-   (AirPlay).
+2. **Audio routing** — writes `/etc/default/snapclient` (single-output),
+   per-room systemd service files plus `/etc/asound.conf` (channel-split) or
+   udev rules (multi-output), or `shairport-sync.conf` (AirPlay).
 3. **ALSA volume** — sets all mixer controls to 100%, runs HAT-specific tuning,
    saves state to `asound.state` on the boot partition.
 4. **ALSA restore service** — installs `alsa-restore-boot.service` to replay
@@ -302,7 +460,9 @@ read-only via `raspi-config overlayfs`. Steps in order:
    `fake-hwclock`, so without this every boot starts at the date the card was
    imaged until NTP catches up, misdating all early-boot log lines.
 8. **Startup chime** — installs a one-shot service that plays three ascending
-   tones on the first post-provisioning boot, confirming audio is working.
+   tones on the first post-provisioning boot, confirming audio is working. In
+   channel-split mode it plays on each zone in turn, which is what identifies
+   the speakers.
 9. **Journald** — sets `Storage=volatile` so logs go to RAM, not the SD card.
 10. **Passwordless sudo** — for the provisioned user.
 11. **Version stamp** — writes `/etc/provisioner-version` and
@@ -423,6 +583,9 @@ re-run rather than silently leaving the previous settings.
 Only paths `provision.sh` authors are cleared. Files it always writes identically
 — the sudoers drop-in, the clock units, the chime — are deliberately left alone,
 as is operational state on the boot partition (`netlog.txt`, `clock.save`).
+`/etc/asound.conf` is a special case, since it is system-wide ALSA config rather
+than exclusively ours: it is removed only when it carries the marker line
+`provision.sh` writes into the copy it generates for channel-split mode.
 
 **What it cannot change**, because these are applied by `patch-userdata.py` at
 image time rather than by `provision.sh`:
