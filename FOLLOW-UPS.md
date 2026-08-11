@@ -264,4 +264,12 @@ reconnect rung, but not the driver reload.
   current host key into `players/<hostname>.hostkey` first, or its identity
   changes once.
 - **Changing `WIFI_MODE` changes the MAC**, and therefore the Snapcast client
-  ID, and therefore requires re-associating the player in Music Assistant.
+  id. Set `SNAPCAST_HOST_ID` to the MAC the player has before the change and it
+  keeps its identity in Music Assistant; without it, the player has to be
+  re-associated by hand.
+- **Two live interfaces means no stable Snapcast id.** An unpinned player with
+  both WiFi and ethernet up picks whichever MAC interface enumeration hands it
+  that boot. Observed on the bedroom player on 2026-08-10: between the two
+  reprovision reboots it registered under the ethernet MAC on its own, leaving a
+  disconnected duplicate behind in MA. Any player that might ever have a cable
+  plugged into it wants `SNAPCAST_HOST_ID` set, not just one being converted.

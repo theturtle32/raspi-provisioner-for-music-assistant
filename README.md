@@ -86,6 +86,7 @@ shown in brackets when re-running against an already-configured card.
 | `ROOM_NAME` | Used for the hostname (`snapplayer-<room>`) and MA player name |
 | `AUDIO_DEVICE` | ALSA device string, or `auto` to detect the first non-built-in card |
 | `SNAPCLIENT_LATENCY` | Latency offset in ms (snapcast only; see [Latency tuning](#latency-tuning)) |
+| `SNAPCAST_HOST_ID` | Optional; snapcast only. Pins the Snapcast client id so it survives a MAC change — see [Keeping a player's identity](#keeping-a-players-identity) |
 | `LEFT_ROOM` / `RIGHT_ROOM` | Split mode only: the player name for each channel. Leave one blank if that channel has nothing wired to it yet |
 | `MONO_MIX_GAIN` | Split mode only: gain per half of the mono downmix (default `0.5`) |
 | `WIFI_MODE` | `builtin` (default), `usb`, or `none` |
@@ -351,7 +352,11 @@ Power save is set globally rather than per-connection because these profiles are
 regenerated into `/run` by netplan on every boot, so a `nmcli connection modify`
 setting does not reliably survive.
 
-`builtin` and `usb` also install the network watchdog described below.
+`builtin` and `usb` also install the network watchdog described below. `none`
+does not, and convergence removes it if it was there before: the watchdog decides
+everything by pinging the gateway through the WiFi interface, so on a box with no
+radio it would fail every check and escalate all the way to rebooting a player
+that is perfectly healthy.
 
 > **Prefer `builtin` unless you have a specific reason not to.** Cheap USB
 > adapters based on the MT7601U chipset are common and unreliable: clone units
@@ -379,6 +384,48 @@ power-cycles it.
 | 12 | 6 min | Reboot |
 
 Tunable in `/etc/default/player-net`.
+
+---
+
+## Keeping a player's identity
+
+Snapcast identifies a client by MAC address. That is fine until the MAC changes,
+which happens whenever a player starts using a different interface — switching
+`WIFI_MODE`, or moving a wireless player onto ethernet. On a Pi the onboard
+radio and the ethernet port have *different* MACs, so the player arrives in
+Music Assistant as a brand-new client. The old one goes stale, and the new one
+turns up unnamed, at default volume, in no group.
+
+`SNAPCAST_HOST_ID` pins the id instead, via snapclient's `--hostID`:
+
+```
+WIFI_MODE=none
+SNAPCAST_HOST_ID=b8:27:eb:d3:3e:b4    # the MAC it had before the change
+```
+
+Music Assistant then sees the same client it always had, and keeps its name,
+volume, latency and group membership. Find the current id before you change
+anything — once the interface is gone, so is the MAC:
+
+```bash
+ip -br link | awk '{print $1, $3}'
+```
+
+It is not only deliberate changes that move the id. A player with **two live
+interfaces** — a wireless box with an ethernet cable also plugged in — has no
+stable id at all: snapclient picks one MAC, and which one it picks depends on
+interface enumeration that boot. Converting the bedroom player produced exactly
+this. In the window between the two reboots, with both `wlan0` and `eth0` up and
+the pin not yet written, it registered itself under the *ethernet* MAC and left a
+second, disconnected `snapplayer-primary-bedroom` behind in Music Assistant.
+Pinning removes the ambiguity regardless of how many interfaces are up.
+
+Leave it unset on new builds; deriving the id from the MAC is the right default
+when there is no previous identity to preserve. Under
+[channel-split](#channel-split-mode-two-mono-zones-on-one-card) or
+[multi-output](#multi-output-mode) one pinned id covers every zone, because
+`--instance` still distinguishes them: the first keeps the bare id and later ones
+get `id#N`, exactly as they would from a MAC.
 
 ---
 
@@ -593,10 +640,18 @@ image time rather than by `provision.sh`:
 - `HAT_OVERLAY` — writes `dtoverlay=` into `config.txt`
 - the pinned SSH host key, the hostname, and the cloud-init `user-data`
 
-Changing `WIFI_MODE` *is* possible but changes which NIC is used, and therefore
-the MAC, and therefore the Snapcast client ID — the player will need
-re-associating in Music Assistant. See [SSH host keys](#ssh-host-keys) for the
-same caveat applied to host identity.
+Changing `WIFI_MODE` *is* possible, and is one of the things `reprovision.sh` is
+most useful for. It changes which NIC is used, and therefore the MAC, and
+therefore the Snapcast client id — so set `SNAPCAST_HOST_ID` to the MAC the
+player has *now*, in the same run, or it arrives in Music Assistant as a new
+player. See [Keeping a player's identity](#keeping-a-players-identity), and
+[SSH host keys](#ssh-host-keys) for the same caveat applied to host identity.
+
+One ordering note when moving a wireless player to ethernet: run
+`reprovision.sh` against the player's **ethernet** address, not its `.local`
+name. `WIFI_MODE=none` calls `rfkill block wifi` partway through provisioning,
+which would drop an SSH session running over the radio and leave the box
+half-provisioned with the overlay off.
 
 If `provision.sh` fails, the script stops and prints `provision-failed.txt`. The
 overlay is left **off** and the card writable, which is the right state for

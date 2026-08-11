@@ -104,6 +104,7 @@ CHANNEL_SPLIT="${CHANNEL_SPLIT:-false}"
 ROOM_NAME="${ROOM_NAME:-}"
 AUDIO_DEVICE="${AUDIO_DEVICE:-auto}"
 SNAPCLIENT_LATENCY="${SNAPCLIENT_LATENCY:-}"
+SNAPCAST_HOST_ID="${SNAPCAST_HOST_ID:-}"
 LEFT_ROOM="${LEFT_ROOM:-}"
 RIGHT_ROOM="${RIGHT_ROOM:-}"
 LEFT_LATENCY="${LEFT_LATENCY:-}"
@@ -170,6 +171,26 @@ validate_choice CHANNEL_SPLIT "$CHANNEL_SPLIT" true false
 validate_latency SNAPCLIENT_LATENCY "$SNAPCLIENT_LATENCY"
 validate_latency LEFT_LATENCY       "$LEFT_LATENCY"
 validate_latency RIGHT_LATENCY      "$RIGHT_LATENCY"
+
+# The host id is interpolated straight into an ExecStart, so anything with
+# whitespace or shell metacharacters in it would produce a unit that either
+# fails to parse or runs something unintended. Restrict it to what a Snapcast
+# id is ever legitimately made of.
+if [ -n "$SNAPCAST_HOST_ID" ] && ! [[ "$SNAPCAST_HOST_ID" =~ ^[A-Za-z0-9:_.-]+$ ]]; then
+    echo "ERROR: SNAPCAST_HOST_ID='${SNAPCAST_HOST_ID}' contains characters that are not allowed."
+    echo "       Use letters, digits, and any of  : _ . -  (a MAC address is the usual value)."
+    exit 1
+fi
+
+if [ -n "$SNAPCAST_HOST_ID" ] && [ "$PLAYER_TYPE" != snapcast ]; then
+    echo "ERROR: SNAPCAST_HOST_ID only applies to PLAYER_TYPE=snapcast (got '${PLAYER_TYPE}')."
+    exit 1
+fi
+
+# Built once and appended to every snapclient command line. Empty when unset,
+# which leaves snapclient on its default of deriving the id from a MAC address.
+SNAPCAST_ID_OPT=""
+[ -n "$SNAPCAST_HOST_ID" ] && SNAPCAST_ID_OPT=" --hostID ${SNAPCAST_HOST_ID}"
 
 if [ "$CHANNEL_SPLIT" = true ]; then
     # Both layouts want to own the whole audio path, and there is no sensible
@@ -546,7 +567,7 @@ write_snapclient_unit() {
     # No --mixer: snapclient defaults to software volume, which is what keeps
     # players sharing one card independently controllable. 'hardware' would have
     # them all fighting over the same ALSA control.
-    local snapclient_args="-h ${MA_HOST} --instance ${instance} --soundcard ${soundcard}${latency_opt}"
+    local snapclient_args="-h ${MA_HOST} --instance ${instance} --soundcard ${soundcard}${latency_opt}${SNAPCAST_ID_OPT}"
     local exec_start
     if uts_hostname_available; then
         exec_start="${UNSHARE_BIN} --uts /bin/sh -c 'hostname ${slug} && exec /usr/bin/snapclient ${snapclient_args}'"
@@ -598,9 +619,10 @@ setup_single_output() {
     fi
 
     cat > /etc/default/snapclient <<EOF
-SNAPCLIENT_OPTS="-h ${MA_HOST} --soundcard ${AUDIO_DEVICE}${latency_flag}"
+SNAPCLIENT_OPTS="-h ${MA_HOST} --soundcard ${AUDIO_DEVICE}${latency_flag}${SNAPCAST_ID_OPT}"
 EOF
     echo "  Snapclient config written."
+    [ -n "$SNAPCAST_HOST_ID" ] && echo "  Snapcast host id pinned to ${SNAPCAST_HOST_ID}."
     install_restart_dropin snapclient.service
     systemctl enable snapclient
     PLAYER_UNITS="snapclient.service"
@@ -1669,6 +1691,7 @@ write_version_stamp() {
         echo "hat_overlay:  ${HAT_OVERLAY}"
         echo "audio_device: ${AUDIO_DEVICE}"
         echo "latency_ms:   ${SNAPCLIENT_LATENCY:-0}"
+        [ -n "$SNAPCAST_HOST_ID" ] && echo "snapcast_id:  ${SNAPCAST_HOST_ID} (pinned)"
         echo "sound_cards:  ${cards}"
         echo "ntp_server:   ${NTP_SERVER_RESOLVED:-${NTP_SERVER}}"
         echo "timesync_wait:${TIMESYNC_WAIT}"

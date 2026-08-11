@@ -675,6 +675,20 @@ def create_player_env(path, boot_partition):
     if wifi_mode == "usb":
         print("  NOTE: USB WiFi adapter must be plugged in before first boot.")
 
+    # ── Snapcast identity ─────────────────────────────────────────────────────
+    # Snapcast derives a client id from a MAC address, so a player that changes
+    # which interface it uses arrives in Music Assistant as a brand-new player
+    # and loses its name, volume and group membership. Pinning the id keeps the
+    # player it already is.
+    if player_type == "snapcast":
+        print("\n  Snapcast host id (optional — blank derives it from the MAC):")
+        print("    Pin this to keep the player's identity in Music Assistant when")
+        print("    the MAC changes, e.g. switching WIFI_MODE or moving to ethernet.")
+        host_id = prompt_optional("SNAPCAST_HOST_ID",
+                                  existing.get("SNAPCAST_HOST_ID", ""))
+        if host_id:
+            lines.append(f"SNAPCAST_HOST_ID={host_id}")
+
     # ── Clock / time sync ─────────────────────────────────────────────────────
     print("\n  Clock (the Pi has no RTC — a late NTP step breaks Snapcast sync):")
     print("    gateway  — auto-detect your router (default; usually answers in ms)")
