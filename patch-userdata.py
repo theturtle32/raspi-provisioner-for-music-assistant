@@ -534,8 +534,13 @@ def patch(data, hostname, player_type="snapcast"):
     # /dev/console from a hangup, which is why systemd's own status lines keep
     # appearing. With Imager's cmdline, console=tty1 comes last, so that is where
     # /dev/console points.
+    #
+    # tee's own stdout is discarded. cloud-init starts the packaged redirect
+    # (tee to the log alone) before it has read user-data, then starts this one
+    # with that first tee as its stdout; passing the stream on writes every line
+    # to the log twice. Discarding it costs only the journal's copy.
     console_output = {
-        "all": "| tee -a /var/log/cloud-init-output.log /dev/console",
+        "all": "| tee -a /var/log/cloud-init-output.log /dev/console >/dev/null",
     }
     if data.get("output") != console_output:
         data["output"] = console_output
