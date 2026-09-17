@@ -64,12 +64,28 @@ config.
 Eject the card, insert it into the Pi, and power on. The Pi will:
 
 1. Sync time via NTP
-2. Install the required packages (`snapclient` or `shairport-sync`, `alsa-utils`, etc.)
+2. Install the required packages (`snapclient` or `shairport-sync`, `alsa-utils`,
+   `overlayroot`, etc.)
 3. Run `provision.sh`
 4. Reboot
 
 After the final reboot (~90 seconds total), the player appears in Music
 Assistant.
+
+Steps 2 and 3 print to the screen as they run, so a monitor on the HDMI port shows
+what first boot is doing rather than a static banner. The same output goes to
+`/var/log/cloud-init-output.log`, which can be followed over SSH once the Pi is on
+the network:
+
+```bash
+ssh <user>@snapplayer-<room>.local tail -f /var/log/cloud-init-output.log
+```
+
+The package install is the long wait. `overlayroot` rebuilds the initramfs for
+every installed kernel, which takes most of a minute on a Pi 3B. It is installed
+up front so that this happens during step 2. `PROVISIONING COMPLETE — rebooting
+now` is the last thing `provision.sh` prints, and cloud-init issues the reboot
+within a second or two of it.
 
 ---
 

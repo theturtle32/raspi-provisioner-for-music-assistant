@@ -1784,16 +1784,18 @@ prune_unpinned_host_keys
 # 12. Record which revision built this card
 write_version_stamp
 
-# 13. Restore /etc/issue and notify before reboot
-printf 'Raspbian GNU/Linux \\n \\l\n' > /etc/issue
-wall $'\n*** PROVISIONING COMPLETE — rebooting now. ***\nThis is expected and normal.\n' 2>/dev/null || true
-printf '\n\n*** PROVISIONING COMPLETE — rebooting now. ***\n\n' > /dev/tty1 2>/dev/null || true
-
-rm -f "${BOOT_PART}/provision-failed.txt" 2>/dev/null || true
-sync 2>/dev/null || true
-
-# 14. Enable overlay filesystem — must be last step before reboot
+# 13. Enable overlay filesystem — the last change made to the system.
+#     Cards patched by a current patch-userdata.py already have overlayroot, so
+#     this is quick; older ones install it here, which takes a minute or so.
 echo "Enabling overlay filesystem..."
 raspi-config nonint enable_overlayfs
 
+# 14. Restore /etc/issue and announce the reboot. Deliberately after everything
+#     slow, so "rebooting now" is only ever shown when it is true.
+printf 'Raspbian GNU/Linux \\n \\l\n' > /etc/issue
+rm -f "${BOOT_PART}/provision-failed.txt" 2>/dev/null || true
+sync 2>/dev/null || true
+
 echo "=== Provisioning complete: $(date) ==="
+wall $'\n*** PROVISIONING COMPLETE — rebooting now. ***\nThis is expected and normal.\n' 2>/dev/null || true
+printf '\n\n*** PROVISIONING COMPLETE — rebooting now. ***\n\n' > /dev/tty1 2>/dev/null || true

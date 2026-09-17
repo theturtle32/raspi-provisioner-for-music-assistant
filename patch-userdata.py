@@ -21,6 +21,7 @@ What it does:
        - Always updates embedded provision.sh via write_files (read from disk)
        - Adds NTP time-sync wait + apt-get update + install to runcmd
        - Adds runcmd to run provision.sh
+       - Mirrors first-boot output to the console
        - Adds power_state reboot
   3. Optionally patches /boot/firmware/config.txt for HAT overlays
   4. Backs up the original user-data as user-data.bak (once)
@@ -455,8 +456,14 @@ def patch(data, hostname, player_type="snapcast"):
     # turns a missing player package into a silent failure that only surfaces
     # much later, as an unrelated-looking "Unit does not exist" from systemctl.
     # Better for apt to fail loudly at the point the problem actually occurs.
+    # overlayroot is what `raspi-config nonint enable_overlayfs` would otherwise
+    # install on demand at the very end of provision.sh. There it costs close to
+    # a minute on a Pi 3B — its initramfs trigger rebuilds an image for every
+    # installed kernel — after the "rebooting now" banner is already up.
+    # Installed here, that wait happens where waiting is expected, and enabling
+    # the overlay later is just an edit to cmdline.txt.
     apt_install = (f"apt-get {apt_lock} install -y "
-                   f"{player_pkg} alsa-utils avahi-daemon vim sox")
+                   f"{player_pkg} alsa-utils avahi-daemon vim sox overlayroot")
 
     # Match on the verb rather than a literal "apt-get update" substring: the
     # commands carry an -o flag between the two words, so substring matching
@@ -478,8 +485,14 @@ def patch(data, hostname, player_type="snapcast"):
         existing_runcmd.insert(idx + 1, apt_update)
         changed.append("Added apt-get update to runcmd")
 
-    if not any(player_pkg in str(c) for c in existing_runcmd) and \
-       not has_apt("install"):
+    # An install line from an earlier run is replaced rather than kept, so a card
+    # re-patched after the package list changes gets the current list.
+    if has_apt("install"):
+        idx = apt_index("install")
+        if existing_runcmd[idx] != apt_install:
+            existing_runcmd[idx] = apt_install
+            changed.append(f"Updated apt-get install ({player_pkg}) in runcmd")
+    elif not any(player_pkg in str(c) for c in existing_runcmd):
         existing_runcmd.insert(apt_index("update") + 1, apt_install)
         changed.append(f"Added apt-get install ({player_pkg}) to runcmd")
 
@@ -505,6 +518,28 @@ def patch(data, hostname, player_type="snapcast"):
     # per-image RSA and ECDSA keys in place regardless. provision.sh prunes them
     # instead, so the pinned ed25519 is the only identity ever presented.
     changed.append("Pinned SSH host key (ed25519)")
+
+    # ── output: show first-boot progress on the console ───────────────────────
+    # Raspberry Pi OS runs all of cloud-init in one process whose stdout a
+    # packaged drop-in sends to the journal only, so the screen shows nothing
+    # but the banner while apt and provision.sh run. tee to the console as well
+    # as the usual log. A console that cannot be written only costs the mirror:
+    # tee reports it and keeps writing the log, and provisioning is unaffected.
+    #
+    # It has to be /dev/console, not /dev/tty1. cloud-init sets this redirect up
+    # once, early in the init stage, and the same tee then serves every later
+    # stage. getty starts on tty1 after that and hangs the terminal up, which
+    # turns every descriptor opened as /dev/tty1 into EIO — the log carries on
+    # and the screen goes silent. The kernel exempts descriptors opened through
+    # /dev/console from a hangup, which is why systemd's own status lines keep
+    # appearing. With Imager's cmdline, console=tty1 comes last, so that is where
+    # /dev/console points.
+    console_output = {
+        "all": "| tee -a /var/log/cloud-init-output.log /dev/console",
+    }
+    if data.get("output") != console_output:
+        data["output"] = console_output
+        changed.append("Mirrored first-boot output to the console")
 
     # ── power_state: reboot cleanly after runcmd completes ────────────────────
     if "power_state" not in data:
