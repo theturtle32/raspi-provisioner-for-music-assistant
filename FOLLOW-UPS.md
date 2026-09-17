@@ -217,25 +217,32 @@ actually flapping; otherwise it is machinery for a hypothetical.
 
 ---
 
-## Channel-split has not run on hardware yet
+## Channel-split: tuning still unverified
 
-**Status:** known gap.
+**Status:** works on hardware; tuning open.
 
-The generated units, `/etc/asound.conf`, the convergence path and every
-validation refusal were exercised, but only on a machine with no sound card. What
-is unverified is the part only a real card can answer:
+First run on real hardware on 2026-09-17: a Pi 3B with a C-Media USB adapter
+(`0d8c:0014`), zones `test zone left` / `test zone right`, provisioned from a
+fresh image. Confirmed:
 
-- whether `dmix` settles on a format the card supports, with `rate`, `period_size`
-  and `buffer_size` pinned as they are
+- `auto` picked the USB card over the headphone jack
+- `dmix` opened the card at `S16_LE`, 48000 Hz, 2 channels, `period_size` 1024,
+  `buffer_size` 8192 — the pinned values, no negotiation surprises
+- both zones play at once, each audible only on its own channel, and the chime
+  identified them left then right
+- MA shows two players, `test-zone-left` and `test-zone-right`, with ids `<mac>`
+  and `<mac>#2`
+
+Still open — tuning rather than failure, and only answerable with real speakers
+in real rooms:
+
 - whether `snd_pcm_delay` through `dmix` → `route` reports accurately enough for
   Snapcast to hold sync against the other players, and what latency offset the
   zones end up needing
 - whether `0.5` per leg of the downmix is loud enough on a single ceiling speaker
   with the amp already at 100%
-
-The first is self-announcing: `verify_zone_devices` warns at provisioning time,
-and on first boot the chime simply does not play. The second and third are
-tuning, not failure.
+- a HAT rather than a USB DAC. The dmix path is the same, but the Merus amp's
+  supported formats differ, and that is exactly what `dmix` has to settle on
 
 ---
 
