@@ -1293,6 +1293,33 @@ EOF
     echo "  Clock-sync gate installed (max ${TIMESYNC_WAIT}s) for: ${PLAYER_UNITS}"
 }
 
+# Retry NTP the moment a network connection comes up.
+#
+# timesyncd learns about connectivity from systemd-networkd, which these images
+# do not run; NetworkManager does the networking. So an attempt made before the
+# link is up fails with "No route to host", timesyncd logs "Waiting after
+# exhausting servers", and nothing prompts it again until ConnectionRetrySec
+# (30s) runs out — up to half a minute of player startup spent with the network
+# already working. A dispatcher hook turns that into an event: restarting
+# timesyncd makes it query immediately.
+#
+# Unconditional, whatever NTP_SERVER says: the wait is the same for the Debian
+# pool. try-restart leaves a timesyncd that someone stopped alone. Restarting an
+# already-synchronised timesyncd costs one NTP query and a slew of a few
+# milliseconds, so there is nothing to gain from being clever about when.
+install_timesync_kick() {
+    mkdir -p /etc/NetworkManager/dispatcher.d
+    cat > /etc/NetworkManager/dispatcher.d/90-timesync-kick.sh <<'EOF'
+#!/bin/sh
+# Installed by provision.sh — retry NTP as soon as a connection is up.
+[ "$2" = up ] || exit 0
+[ "$1" = lo ] && exit 0
+exec systemctl --no-block try-restart systemd-timesyncd.service
+EOF
+    chmod 755 /etc/NetworkManager/dispatcher.d/90-timesync-kick.sh
+    echo "  NTP retry-on-connect dispatcher installed."
+}
+
 # ══ CLOCK PERSISTENCE ══════════════════════════════════════════════════════════
 # The Pi has no RTC, and the overlay means fake-hwclock's own data file is
 # reverted to its image-bake value on every boot. Left alone, every boot starts
@@ -1755,6 +1782,7 @@ configure_network
 #    After configure_network so 'gateway' auto-detection has a default route.
 configure_time_sync
 install_timesync_gate
+install_timesync_kick
 
 # 7. Persist the clock across reboots (no RTC + overlay FS)
 configure_clock_persistence

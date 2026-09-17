@@ -467,6 +467,17 @@ timesyncd switches over automatically if it stops answering. A router typically
 replies in tens of milliseconds rather than seconds, so sync lands almost
 immediately at boot.
 
+Almost immediately *once the network is up*, which timesyncd cannot tell for
+itself here. It follows connectivity through systemd-networkd, and these images
+use NetworkManager, so an attempt made before the link is ready fails with
+`No route to host` and is not retried until `ConnectionRetrySec` (30 s) has run
+out. Measured on a first boot: the lease arrived 18 s before sync did.
+`provision.sh` therefore installs
+`/etc/NetworkManager/dispatcher.d/90-timesync-kick.sh`, which restarts
+timesyncd whenever a connection comes up; the restarted daemon queries at once,
+and sync followed network-up by a third of a second in testing. It is installed
+whatever `NTP_SERVER` is set to, since the wait is the same for the Debian pool.
+
 `TIMESYNC_WAIT` installs an `ExecStartPre` on the player unit only. It is
 **deliberately not** implemented by enabling `systemd-time-wait-sync.service`:
 that unit is `TimeoutStartSec=infinity` and gates `time-sync.target`, which also
@@ -515,8 +526,9 @@ read-only via `raspi-config overlayfs`. Steps in order:
    the saved state on every subsequent boot (before snapclient starts).
 5. **Network** — applies WiFi mode config, NM reconnection dispatcher, global
    power-save-off drop-in, and the network watchdog.
-6. **Time sync** — points `timesyncd` at `NTP_SERVER` and installs the
-   `TIMESYNC_WAIT` gate on the player unit. See
+6. **Time sync** — points `timesyncd` at `NTP_SERVER`, installs the
+   `TIMESYNC_WAIT` gate on the player unit, and adds a dispatcher hook that
+   retries NTP when a connection comes up. See
    [Clock and time sync](#clock-and-time-sync).
 7. **Clock persistence** — installs save/restore units that keep the system
    clock on the boot partition. The Pi has no RTC and the overlay reverts
