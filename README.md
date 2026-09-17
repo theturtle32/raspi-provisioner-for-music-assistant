@@ -469,14 +469,25 @@ immediately at boot.
 
 Almost immediately *once the network is up*, which timesyncd cannot tell for
 itself here. It follows connectivity through systemd-networkd, and these images
-use NetworkManager, so an attempt made before the link is ready fails with
-`No route to host` and is not retried until `ConnectionRetrySec` (30 s) has run
-out. Measured on a first boot: the lease arrived 18 s before sync did.
+use NetworkManager, so an attempt made before IPv4 is ready fails with
+`Network is unreachable` and is not retried until `ConnectionRetrySec` (30 s)
+has run out. Measured at boot, on the monotonic clock: the players started
+30.5 s after the DHCP lease.
+
 `provision.sh` therefore installs
 `/etc/NetworkManager/dispatcher.d/90-timesync-kick.sh`, which restarts
-timesyncd whenever a connection comes up; the restarted daemon queries at once,
-and sync followed network-up by a third of a second in testing. It is installed
-whatever `NTP_SERVER` is set to, since the wait is the same for the Debian pool.
+timesyncd — and so makes it query at once — when IPv4 connectivity arrives,
+for as long as the clock is still unsynchronised. It acts on both `up` and
+`dhcp4-change`: NetworkManager treats a connection as up as soon as IPv6
+autoconfiguration completes, which can be seconds before the DHCPv4 lease, and
+the lease arriving later is reported only as `dhcp4-change`. Once the clock is
+synchronised it does nothing, so lease renewals do not restart timesyncd. It is
+installed whatever `NTP_SERVER` is set to, since the Debian pool waits the same
+way.
+
+When reading boot logs for this, use `journalctl -o short-monotonic`. The
+first sync steps the clock, often by tens of seconds, and wall-clock timestamps
+on either side of the step make the wait look longer than it was.
 
 `TIMESYNC_WAIT` installs an `ExecStartPre` on the player unit only. It is
 **deliberately not** implemented by enabling `systemd-time-wait-sync.service`:
